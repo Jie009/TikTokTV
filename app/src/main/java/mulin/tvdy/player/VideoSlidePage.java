@@ -27,6 +27,9 @@ final class VideoSlidePage {
     final ImageView snapshotImage;
     final PlayerView playerView;
 
+    /** When false, async cover loads must not re-opaque the mask over live video. */
+    private boolean coverMaskActive = false;
+
     VideoSlidePage(View rootView) {
         root = (FrameLayout) rootView;
         backdropImage = root.findViewById(R.id.backdropImage);
@@ -34,6 +37,7 @@ final class VideoSlidePage {
         snapshotImage = root.findViewById(R.id.snapshotImage);
         playerView = root.findViewById(R.id.playerView);
         playerView.setShutterBackgroundColor(Color.TRANSPARENT);
+        playerView.setKeepContentOnPlayerReset(true);
     }
 
     void attachPlayer(ExoPlayer player) {
@@ -115,6 +119,45 @@ final class VideoSlidePage {
     void clearSnapshot() {
         snapshotImage.setVisibility(View.GONE);
         snapshotImage.setImageBitmap(null);
+    }
+
+    void stageForSlide(float offScreenY) {
+        clearSnapshot();
+        showBlackUntilCover();
+        root.animate().cancel();
+        root.setTranslationY(offScreenY);
+    }
+
+    void resetCoverMaskForPlayback() {
+        coverMaskActive = true;
+        coverImage.animate().cancel();
+        coverImage.setAlpha(1f);
+    }
+
+    boolean isCoverMaskActive() {
+        return coverMaskActive;
+    }
+
+    /** Opaque black (or later the cover bitmap) fully masks the player surface. */
+    void showBlackUntilCover() {
+        coverMaskActive = true;
+        coverImage.animate().cancel();
+        coverImage.setImageDrawable(null);
+        coverImage.setAlpha(1f);
+        backdropImage.setImageDrawable(null);
+    }
+
+    void revealCoverMask() {
+        if (!coverMaskActive) return;
+        if (coverImage.getDrawable() != null) {
+            coverImage.setAlpha(1f);
+        }
+    }
+
+    void dismissCoverMask() {
+        coverMaskActive = false;
+        coverImage.animate().cancel();
+        coverImage.animate().alpha(0f).setDuration(120).start();
     }
 
     void resetForReuse(float offScreenY) {

@@ -104,11 +104,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private static final String TAG = "PlayerActivity";
-    private static final int PRELOAD_AHEAD = 3;
-    /** Preload budget while the user is actively watching (short head-start only). */
-    private static final long PRELOAD_PLAYING_US = 10_000_000L;
-    /** While paused, buffer the full upcoming playlist item(s). */
-    private static final long PRELOAD_PAUSED_US = 600_000_000L;
+    private static final int PRELOAD_AHEAD = 5;
+    /** Buffer the full upcoming playlist item(s) ahead of the playhead. */
+    private static final long PRELOAD_FULL_US = 600_000_000L;
     /** Min media duration ExoPlayer tries to keep buffered while playing. */
     private static final int MIN_BUFFER_MS = 30_000;
     /** Max media duration ExoPlayer will buffer ahead of the playhead. */
@@ -127,8 +125,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     /** Interval between repeated seeks while the key stays down. */
     private static final long SEEK_REPEAT_INTERVAL_MS = 300;
     private static final int SLIDE_DURATION_MS = 280;
-    /** Max wait for the incoming video's first frame before starting the slide. */
-    private static final long SLIDE_FRAME_WAIT_MS = 500;
+    /** Max wait for the incoming item to buffer before starting the slide. */
+    private static final long INCOMING_BUFFER_WAIT_MS = 450;
+    /** Min buffered ahead on the incoming item before we slide (unless timed out). */
+    private static final long MIN_INCOMING_BUFFER_MS = 800;
+    /** Max wait for the incoming cover before sliding anyway (black mask until loaded). */
+    private static final long INCOMING_COVER_WAIT_MS = 450;
     private static final long CONTROLS_AUTO_HIDE_MS = 3_000;
     /** Window for the "press back again to exit" confirmation. */
     private static final long EXIT_CONFIRM_MS = 2_000;
@@ -188,11 +190,17 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private long startupTimeoutMs;
     private boolean pendingStartupLoginCheck = false;
     private FrameLayout slideHost;
+    private VideoSlidePage pageA;
+    private VideoSlidePage pageB;
+    /** Outgoing page during a slide (always {@link #pageA} – owns the player). */
     private VideoSlidePage pageOut;
+    /** Incoming cover page during a slide (always {@link #pageB}, no player). */
     private VideoSlidePage pageIn;
     /** The page that currently owns the ExoPlayer surface. */
     private VideoSlidePage playerPage;
     private boolean slideAnimating = false;
+    /** Next/previous press absorbed while a slide is still running. */
+    private int queuedAdvanceDuringSlide = 0;
     /** First frame arrived while the slide animation was still running. */
     private boolean pendingCoverDismiss = false;
     /** Convenience alias – always {@link #pageOut}'s views while idle. */
@@ -266,14 +274,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private CreatorGridAdapter creatorGridAdapter;
     private FeedVideo feedAnchorVideo;
     private long feedAnchorPositionMs;
-    /** Blocks ExoPlayer auto-advance right after returning from creator browse. */
-    private boolean suppressFeedAutoAdvance = false;
+    /** Ignores stale {@link Player#STATE_ENDED} while rebuilding feed anchor playlist. */
+    private long ignorePlaybackEndedUntilMs = 0;
 
     private final Runnable hideControlsRunnable = this::hideControls;
     private final Runnable startupTimeoutRunnable = this::onStartupTimeout;
     private final Runnable longPressRunnable = this::openFeatureMenu;
-    private final Runnable releaseSuppressFeedAutoAdvanceRunnable =
-            () -> suppressFeedAutoAdvance = false;
     private long seekRepeatDeltaMs = 0;
     private final Runnable seekRepeatRunnable = new Runnable() {
         @Override
@@ -305,12 +311,14 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         splashAnimation = findViewById(R.id.splashAnimation);
         splashStatusText = findViewById(R.id.splashStatusText);
         slideHost = findViewById(R.id.slideHost);
-        pageOut = new VideoSlidePage(findViewById(R.id.slidePageA));
-        pageIn = new VideoSlidePage(findViewById(R.id.slidePageB));
-        playerPage = pageOut;
-        playerView = pageOut.playerView;
-        coverImage = pageOut.coverImage;
-        backdropImage = pageOut.backdropImage;
+        pageA = new VideoSlidePage(findViewById(R.id.slidePageA));
+        pageB = new VideoSlidePage(findViewById(R.id.slidePageB));
+        pageOut = pageA;
+        pageIn = pageB;
+        playerPage = pageA;
+        playerView = pageA.playerView;
+        coverImage = pageA.coverImage;
+        backdropImage = pageA.backdropImage;
         initSlidePages();
         loadingSpinner = findViewById(R.id.loadingSpinner);
         pauseIcon = findViewById(R.id.pauseIcon);
@@ -404,7 +412,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                         // also fight over system audio focus.
                         /* handleAudioFocus= */ false)
                 .build();
-        player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_PLAYING_US));
+        player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_FULL_US));
         player.setRepeatMode(Player.REPEAT_MODE_OFF);
         player.setPauseAtEndOfMediaItems(true);
 
@@ -414,14 +422,16 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 if (playbackState == Player.STATE_READY && splashVisible && !playlist.isEmpty()) {
                     hideSplashIfNeeded();
                 }
+                if (playbackState == Player.STATE_READY && !slideAnimating) {
+                    refillPlaylist();
+                }
                 if (playbackState == Player.STATE_ENDED) {
-                    if (suppressFeedAutoAdvance && playbackMode == PlaybackMode.FEED) {
-                        player.seekTo(playlistIndex, 0);
-                        player.pause();
+                    if (System.currentTimeMillis() < ignorePlaybackEndedUntilMs) {
                         updatePlaybackChrome();
-                    } else {
-                        playNext();
+                        return;
                     }
+                    handlePlaybackEnded();
+                    return;
                 } else {
                     updatePlaybackChrome();
                     updateProgressUi();
@@ -440,6 +450,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 updatePlaybackChrome();
                 if (isPlaying) {
                     adjustPreloadForPlay();
+                    scheduleCoverDismissFallback();
                 }
             }
 
@@ -470,14 +481,15 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         startInitialPlayback();
     }
 
-    /** Keeps the idle incoming page off-screen and below the active page in z-order. */
+    /** Keeps the live player on page A; page B is cover-only staging off-screen. */
     private void initSlidePages() {
-        pageIn.detachPlayer();
-        pageOut.root.bringToFront();
+        pageB.detachPlayer();
+        pageA.attachPlayer(player);
+        pageA.root.bringToFront();
         Runnable parkIncoming = () -> {
             int height = slideHost.getHeight();
             if (height > 0) {
-                pageIn.resetForReuse(height);
+                pageB.stageForSlide(height);
             }
         };
         if (slideHost.getHeight() > 0) {
@@ -718,17 +730,17 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             player.clearMediaItems();
         }
         slideAnimating = false;
-        pageOut.clearSnapshot();
-        pageIn.clearSnapshot();
-        pageOut.attachPlayer(player);
-        pageIn.detachPlayer();
-        pageOut.root.setTranslationY(0);
-        playerPage = pageOut;
-        playerView = pageOut.playerView;
-        coverImage = pageOut.coverImage;
-        backdropImage = pageOut.backdropImage;
+        pageA.clearSnapshot();
+        pageB.clearSnapshot();
+        pageA.attachPlayer(player);
+        pageB.detachPlayer();
+        pageA.root.setTranslationY(0);
+        playerPage = pageA;
+        playerView = pageA.playerView;
+        coverImage = pageA.coverImage;
+        backdropImage = pageA.backdropImage;
         showActivePage();
-        slideHost.post(() -> pageIn.resetForReuse(slideHost.getHeight()));
+        slideHost.post(() -> pageB.stageForSlide(slideHost.getHeight()));
         coverImage.setAlpha(1f);
         scheduleStartupTimeout();
         pump.setLoggedIn(loggedIn);
@@ -1022,7 +1034,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     /** Short head-start for the next item while actively playing. */
     private void adjustPreloadForPlay() {
         if (player != null) {
-            player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_PLAYING_US));
+            player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_FULL_US));
         }
     }
 
@@ -1030,7 +1042,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private void adjustPreloadForPause() {
         if (player == null) return;
         refillPlaylist();
-        player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_PAUSED_US));
+        player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_FULL_US));
     }
 
     private void seekBy(long deltaMs) {
@@ -1318,9 +1330,30 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 SimpleImageLoader.preload(next.coverUrl);
             }
         }
+        ensurePlayerQueueSynced();
         waitingForBuffer = false;
         pendingAdvance = 0;
+        autoStartWhenReady = true;
         advance(1);
+    }
+
+    /** Runs the slide transition after a video finishes naturally. */
+    private void handlePlaybackEnded() {
+        if (slideAnimating) {
+            queuedAdvanceDuringSlide = 1;
+            updatePlaybackChrome();
+            return;
+        }
+        refillPlaylist();
+        handler.post(this::playNext);
+    }
+
+    /** Keeps ExoPlayer's internal queue aligned with {@link #playlist}. */
+    private void ensurePlayerQueueSynced() {
+        if (player == null) return;
+        for (int i = player.getMediaItemCount(); i < playlist.size(); i++) {
+            player.addMediaItem(mediaItemFor(playlist.get(i)));
+        }
     }
 
     private void playPrevious() {
@@ -1377,15 +1410,17 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      *                  {@code -1} for previous (A exits down, B enters from top).
      */
     private void advance(int direction) {
-        if (slideAnimating) return;
+        if (slideAnimating) {
+            if (direction > 0) {
+                queuedAdvanceDuringSlide = 1;
+            } else if (direction < 0) {
+                queuedAdvanceDuringSlide = -1;
+            }
+            return;
+        }
 
         int newIndex = playlistIndex + direction;
         if (newIndex < 0 || newIndex >= playlist.size()) return;
-
-        if (playbackMode == PlaybackMode.FEED) {
-            suppressFeedAutoAdvance = false;
-            handler.removeCallbacks(releaseSuppressFeedAutoAdvanceRunnable);
-        }
 
         int height = slideHost.getHeight();
         if (height == 0) {
@@ -1396,85 +1431,147 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         slideAnimating = true;
         pendingCoverDismiss = false;
         rememberCurrentPosition();
-        playlistIndex = newIndex;
+
         if (direction > 0) {
             refillPlaylist();
         }
 
-        FeedVideo incoming = playlist.get(playlistIndex);
-        current = incoming;
+        FeedVideo incomingTarget = playlist.get(newIndex);
+        Long resumeMs = resumePositions.get(incomingTarget.awemeId);
 
-        // Freeze the whole outgoing page (video + blurred pillarbox sides).
+        // Snapshot outgoing video while the player still sits on page A.
         Bitmap frozen = pageOut.capturePageSnapshot();
         pageOut.showSnapshot(frozen);
-        pageOut.detachPlayer();
 
-        // Seek while detached so the new surface never paints the old item.
-        Long resumeMs = resumePositions.get(incoming.awemeId);
-        player.seekTo(playlistIndex, resumeMs != null ? resumeMs : 0L);
+        // Seek on the same surface so ExoPlayer keeps its preloaded buffer.
+        seekToPlaylistItem(direction, newIndex, resumeMs);
+        final FeedVideo incoming = playlist.get(playlistIndex);
+        current = incoming;
 
-        // Stage the incoming video on the off-screen page.
+        // Player stays on page A after the seek — swap its cover/backdrop to the
+        // incoming item now so clearing the outgoing snapshot never reveals the
+        // previous video's artwork.
+        applyPageVisuals(pageOut, incoming);
+
         float entryY = direction * height;
-        pageIn.resetForReuse(entryY);
-        pageIn.attachPlayer(player);
-        playerPage = pageIn;
-
-        applyIncomingCover(pageIn, incoming, () -> runDualPageSlide(direction, height));
+        pageIn.stageForSlide(entryY);
         applySharedUi(incoming);
         player.play();
+
+        Runnable startSlide = () -> applyIncomingCover(
+                pageIn, incoming, () -> runDualPageSlide(direction, height));
+        if (shouldSlideImmediately(incoming, resumeMs)) {
+            startSlide.run();
+        } else {
+            runWhenIncomingBuffered(startSlide);
+        }
+    }
+
+    /** Skip the buffer gate when the incoming item is already staged to play. */
+    private boolean shouldSlideImmediately(FeedVideo incoming, Long resumeMs) {
+        if (resumeMs != null) return true;
+        if (SimpleImageLoader.isCached(incoming.coverUrl)) return true;
+        return hasIncomingBuffer();
+    }
+
+    /**
+     * Jumps to a playlist neighbour, preferring {@code seekToNextMediaItem}/
+     * {@code seekToPreviousMediaItem} so Media3 can reuse its preload window.
+     */
+    private void seekToPlaylistItem(int direction, int targetIndex, Long resumeMs) {
+        if (resumeMs != null) {
+            playlistIndex = targetIndex;
+            player.seekTo(playlistIndex, resumeMs);
+            return;
+        }
+        ensurePlayerQueueSynced();
+        if (direction > 0 && player.getPlaybackState() == Player.STATE_ENDED) {
+            // seekToNextMediaItem() is unreliable from ENDED; jump explicitly instead.
+            playlistIndex = targetIndex;
+            player.setPlayWhenReady(true);
+            player.seekTo(playlistIndex, 0);
+            return;
+        }
+        if (direction > 0) {
+            player.seekToNextMediaItem();
+        } else {
+            player.seekToPreviousMediaItem();
+        }
+        playlistIndex = player.getCurrentMediaItemIndex();
     }
 
     private void advanceInstant(int direction) {
         rememberCurrentPosition();
-        playlistIndex += direction;
-        if (playlistIndex < 0 || playlistIndex >= playlist.size()) {
-            playlistIndex -= direction;
-            return;
-        }
+        int newIndex = playlistIndex + direction;
+        if (newIndex < 0 || newIndex >= playlist.size()) return;
         if (direction > 0) refillPlaylist();
-        Long resumeMs = resumePositions.get(playlist.get(playlistIndex).awemeId);
-        player.seekTo(playlistIndex, resumeMs != null ? resumeMs : 0L);
+        Long resumeMs = resumePositions.get(playlist.get(newIndex).awemeId);
+        seekToPlaylistItem(direction, newIndex, resumeMs);
         applyCurrentUi();
         player.play();
     }
 
     /**
      * Loads the <em>incoming</em> video's cover + blurred backdrop onto the
-     * off-screen page and keeps the cover visible as a mask during the slide.
+     * off-screen page. The page stays black until artwork is ready; the slide
+     * may start on timeout even if the cover is still loading.
      */
     private void applyIncomingCover(VideoSlidePage page, FeedVideo video, Runnable whenReady) {
-        page.coverImage.animate().cancel();
-        page.coverImage.setAlpha(1f);
+        page.showBlackUntilCover();
         page.coverImage.setTag(video.coverUrl);
         page.backdropImage.setTag(video.coverUrl);
 
-        final boolean[] done = {false};
+        final boolean[] slideStarted = {false};
         final Runnable[] timeoutHolder = new Runnable[1];
-        Runnable ready = () -> {
-            if (done[0]) return;
-            if (video.coverUrl != null && !video.coverUrl.equals(page.coverImage.getTag())) return;
-            done[0] = true;
+        Runnable startSlide = () -> {
+            if (slideStarted[0]) return;
+            slideStarted[0] = true;
             if (timeoutHolder[0] != null) {
                 handler.removeCallbacks(timeoutHolder[0]);
             }
-            page.coverImage.setAlpha(1f);
             whenReady.run();
         };
-        timeoutHolder[0] = ready;
+
+        if (video.coverUrl == null || video.coverUrl.isEmpty()) {
+            startSlide.run();
+            return;
+        }
+
+        Runnable onArtworkReady = () -> {
+            if (video.coverUrl != null && !video.coverUrl.equals(page.coverImage.getTag())) {
+                return;
+            }
+            page.revealCoverMask();
+            startSlide.run();
+        };
 
         if (SimpleImageLoader.applyCachedCover(video.coverUrl, page.coverImage, page.backdropImage)) {
-            ready.run();
+            onArtworkReady.run();
             return;
         }
         SimpleImageLoader.loadWithBackdrop(
-                video.coverUrl, page.coverImage, page.backdropImage, ready);
-        handler.postDelayed(timeoutHolder[0], SLIDE_FRAME_WAIT_MS);
+                video.coverUrl, page.coverImage, page.backdropImage, onArtworkReady);
+        timeoutHolder[0] = startSlide;
+        handler.postDelayed(timeoutHolder[0], INCOMING_COVER_WAIT_MS);
     }
 
     private void dismissCoverOnPlayerPage() {
         if (playerPage == null) return;
-        playerPage.coverImage.animate().alpha(0f).setDuration(120).start();
+        handler.removeCallbacks(coverDismissFallbackRunnable);
+        playerPage.dismissCoverMask();
         pendingCoverDismiss = false;
+    }
+
+    private final Runnable coverDismissFallbackRunnable = () -> {
+        if (slideAnimating || playerPage == null || !playerPage.isCoverMaskActive()) return;
+        if (player != null && player.isPlaying()) {
+            dismissCoverOnPlayerPage();
+        }
+    };
+
+    private void scheduleCoverDismissFallback() {
+        handler.removeCallbacks(coverDismissFallbackRunnable);
+        handler.postDelayed(coverDismissFallbackRunnable, 600);
     }
 
     private void runDualPageSlide(int direction, int height) {
@@ -1495,26 +1592,54 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private void finishDualPageSlide(int direction, int height) {
         pageOut.clearSnapshot();
-
-        VideoSlidePage tmp = pageOut;
-        pageOut = pageIn;
-        pageIn = tmp;
-
-        playerPage = pageOut;
-        playerView = pageOut.playerView;
-        coverImage = pageOut.coverImage;
-        backdropImage = pageOut.backdropImage;
-
         pageOut.root.setTranslationY(0);
-        pageIn.resetForReuse(direction * height);
+        pageIn.stageForSlide(direction * height);
         showActivePage();
 
         slideAnimating = false;
         if (pendingCoverDismiss) {
             dismissCoverOnPlayerPage();
         }
+        refillPlaylist();
         updatePlaybackChrome();
         updateProgressUi();
+
+        int queued = queuedAdvanceDuringSlide;
+        queuedAdvanceDuringSlide = 0;
+        if (queued != 0) {
+            handler.post(() -> advance(queued));
+        }
+    }
+
+    private boolean hasIncomingBuffer() {
+        if (player == null) return true;
+        long buffered = player.getBufferedPosition();
+        long pos = player.getCurrentPosition();
+        long duration = player.getDuration();
+        if (duration != C.TIME_UNSET && duration > 0 && buffered >= duration - 500) {
+            return true;
+        }
+        return buffered - pos >= MIN_INCOMING_BUFFER_MS;
+    }
+
+    /** Gives fast swipes a moment to fill the incoming item before sliding. */
+    private void runWhenIncomingBuffered(Runnable action) {
+        if (hasIncomingBuffer()) {
+            action.run();
+            return;
+        }
+        final long deadlineMs = System.currentTimeMillis() + INCOMING_BUFFER_WAIT_MS;
+        Runnable poll = new Runnable() {
+            @Override
+            public void run() {
+                if (hasIncomingBuffer() || System.currentTimeMillis() >= deadlineMs) {
+                    action.run();
+                    return;
+                }
+                handler.postDelayed(this, 50);
+            }
+        };
+        handler.post(poll);
     }
 
     /**
@@ -1591,17 +1716,23 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (playlistIndex < 0 || playlistIndex >= playlist.size()) return;
         FeedVideo video = playlist.get(playlistIndex);
         current = video;
-        applyPageVisuals(pageOut, video);
+        applyPageVisuals(pageA, video);
         applySharedUi(video);
     }
 
     private void applyPageVisuals(VideoSlidePage page, FeedVideo video) {
         page.coverImage.animate().cancel();
-        page.coverImage.setAlpha(1f);
+        page.coverImage.setTag(video.coverUrl);
+        page.backdropImage.setTag(video.coverUrl);
+        if (page == playerPage) {
+            page.resetCoverMaskForPlayback();
+        }
         if (SimpleImageLoader.applyCachedCover(video.coverUrl, page.coverImage, page.backdropImage)) {
-            // cover ready
+            page.revealCoverMask();
         } else {
-            SimpleImageLoader.loadWithBackdrop(video.coverUrl, page.coverImage, page.backdropImage);
+            page.showBlackUntilCover();
+            SimpleImageLoader.loadWithBackdrop(
+                    video.coverUrl, page.coverImage, page.backdropImage, page::revealCoverMask);
         }
         SimpleImageLoader.preload(video.coverUrl);
     }
@@ -1896,9 +2027,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private void rebuildFeedPlaylistFromAnchor() {
-        suppressFeedAutoAdvance = true;
-        handler.removeCallbacks(releaseSuppressFeedAutoAdvanceRunnable);
-        handler.postDelayed(releaseSuppressFeedAutoAdvanceRunnable, 8_000);
+        ignorePlaybackEndedUntilMs = System.currentTimeMillis() + 800;
 
         playlist.clear();
         player.clearMediaItems();
@@ -1967,21 +2096,25 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         playbackMode = PlaybackMode.CREATOR;
         waitingForBuffer = false;
         pendingAdvance = 0;
+        pendingCoverDismiss = false;
+        handler.removeCallbacks(coverDismissFallbackRunnable);
 
         playlist.clear();
-        player.clearMediaItems();
         slideAnimating = false;
-        pageOut.clearSnapshot();
-        pageIn.clearSnapshot();
-        pageOut.attachPlayer(player);
-        pageIn.detachPlayer();
-        pageOut.root.setTranslationY(0);
-        playerPage = pageOut;
-        playerView = pageOut.playerView;
-        coverImage = pageOut.coverImage;
-        backdropImage = pageOut.backdropImage;
+        pageA.clearSnapshot();
+        pageB.clearSnapshot();
+        pageA.detachPlayer();
+        player.stop();
+        player.clearMediaItems();
+        pageA.attachPlayer(player);
+        pageB.detachPlayer();
+        pageA.root.setTranslationY(0);
+        playerPage = pageA;
+        playerView = pageA.playerView;
+        coverImage = pageA.coverImage;
+        backdropImage = pageA.backdropImage;
         showActivePage();
-        slideHost.post(() -> pageIn.resetForReuse(slideHost.getHeight()));
+        slideHost.post(() -> pageB.stageForSlide(slideHost.getHeight()));
 
         playlist.addAll(videos);
         playlistIndex = index;
@@ -1991,12 +2124,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             SimpleImageLoader.preload(video.coverUrl);
         }
 
+        player.prepare();
         player.seekTo(playlistIndex, 0);
         applyCurrentUi();
-        player.prepare();
         player.setPlayWhenReady(true);
         player.play();
         adjustPreloadForPlay();
+        scheduleCoverDismissFallback();
         updatePlaybackChrome();
         refillPlaylist();
     }

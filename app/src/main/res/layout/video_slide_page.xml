@@ -13,14 +13,6 @@
         android:contentDescription="@null"
         android:scaleType="centerCrop" />
 
-    <ImageView
-        android:id="@+id/coverImage"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="#000000"
-        android:contentDescription="@null"
-        android:scaleType="centerCrop" />
-
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
@@ -29,6 +21,15 @@
         app:resize_mode="fit"
         app:surface_type="texture_view"
         app:use_controller="false" />
+
+    <!-- Above the player so the cover fully masks the previous frame until playback starts. -->
+    <ImageView
+        android:id="@+id/coverImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop" />
 
     <!-- Full-page freeze frame (video + blurred pillarbox backdrop). -->
     <ImageView
