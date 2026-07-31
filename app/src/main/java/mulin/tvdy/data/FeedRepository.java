@@ -30,6 +30,9 @@ public final class FeedRepository {
     // Caps memory growth of the dedup set over a long-running session; oldest
     // ids are evicted first since they're the least likely to reappear.
     private static final int MAX_SEEN_IDS = 2000;
+    /** Stop auto-paging when this many consecutive batches are all filtered out. */
+    private static final int MAX_ALL_FILTERED_BATCHES = 10;
+    private static final long PAGE_REQUEST_COOLDOWN_MS = 2_000;
 
     private static FeedRepository instance;
 
@@ -51,6 +54,11 @@ public final class FeedRepository {
 
     private PageRequester pageRequester;
     private boolean pageRequestInFlight = false;
+    private long lastPageRequestAt = 0;
+    private int consecutiveAllFilteredBatches = 0;
+    private boolean watchedFilterBypass = false;
+
+    private final WatchedAwemeStore watchedStore = WatchedAwemeStore.getInstance();
 
     private FeedRepository() {
     }
@@ -73,8 +81,8 @@ public final class FeedRepository {
      * enqueues the rest.
      */
     public void addAwemeList(JSONArray awemeList) {
-        pageRequestInFlight = false;
         if (awemeList == null) {
+            pageRequestInFlight = false;
             maybeRequestMore();
             return;
         }
@@ -82,8 +90,20 @@ public final class FeedRepository {
         int added = 0;
         int skippedNoUrl = 0;
         int skippedDup = 0;
+        int skippedWatched = 0;
         for (int i = 0; i < awemeList.length(); i++) {
             JSONObject item = awemeList.optJSONObject(i);
+            if (item == null) continue;
+
+            String awemeId = item.optString("aweme_id", "");
+            if (!watchedFilterBypass
+                    && (FeedVideo.isMarkedWatchedByServer(item)
+                    || watchedStore.isWatched(awemeId))) {
+                skippedWatched++;
+                if (!awemeId.isEmpty()) watchedStore.markWatched(awemeId);
+                continue;
+            }
+
             FeedVideo video = FeedVideo.fromAwemeItem(item);
             if (video == null) {
                 skippedNoUrl++;
@@ -99,8 +119,28 @@ public final class FeedRepository {
         }
 
         Log.d(TAG, "addAwemeList: +" + added + " noUrl=" + skippedNoUrl
-                + " dup=" + skippedDup + " bufferSize=" + queue.size());
+                + " dup=" + skippedDup + " watched=" + skippedWatched
+                + " bufferSize=" + queue.size());
 
+        if (added == 0 && awemeList.length() > 0 && skippedWatched > 0) {
+            consecutiveAllFilteredBatches++;
+            pageRequestInFlight = false;
+            if (consecutiveAllFilteredBatches < MAX_ALL_FILTERED_BATCHES) {
+                Log.d(TAG, "batch all watched/filtered, requesting next page ("
+                        + consecutiveAllFilteredBatches + "/" + MAX_ALL_FILTERED_BATCHES + ")");
+                maybeRequestMore();
+                return;
+            }
+            Log.w(TAG, "too many all-watched batches, allowing repeats so playback can start");
+            watchedFilterBypass = true;
+            consecutiveAllFilteredBatches = 0;
+            maybeRequestMore();
+            return;
+        } else if (added > 0) {
+            consecutiveAllFilteredBatches = 0;
+        }
+
+        pageRequestInFlight = false;
         if (added > 0) {
             notifyBufferChanged();
         }
@@ -119,15 +159,49 @@ public final class FeedRepository {
         return queue.size();
     }
 
+    /**
+     * Drops all buffered videos and the session dedup set. Call when the
+     * Douyin session identity changes (login/logout) so stale pre-auth feed
+     * items are not played after the pump reloads with new cookies.
+     */
+    public void reset() {
+        queue.clear();
+        seenAwemeIds.clear();
+        pageRequestInFlight = false;
+        consecutiveAllFilteredBatches = 0;
+        watchedFilterBypass = false;
+        watchedStore.bindSession();
+        notifyBufferChanged();
+    }
+
+    /** Called when the user finishes watching a video in ExoPlayer. */
+    public void markConsumed(String awemeId) {
+        if (awemeId == null || awemeId.isEmpty()) return;
+        watchedStore.markWatched(awemeId);
+        seenAwemeIds.add(awemeId);
+        trimSeenIdsIfNeeded();
+    }
+
     /** Ask the pump for another page when the buffer is below {@link #LOW_WATER_MARK}. */
     public void kickstartPaging() {
         maybeRequestMore();
     }
 
+    /**
+     * Clears the in-flight page flag after a proactive fetch fails or times out
+     * so {@link #maybeRequestMore()} can schedule another attempt later.
+     */
+    public void releasePageRequest() {
+        pageRequestInFlight = false;
+    }
+
     private void maybeRequestMore() {
         if (pageRequester == null || pageRequestInFlight) return;
         if (queue.size() >= LOW_WATER_MARK) return;
+        long now = System.currentTimeMillis();
+        if (now - lastPageRequestAt < PAGE_REQUEST_COOLDOWN_MS) return;
         pageRequestInFlight = true;
+        lastPageRequestAt = now;
         pageRequester.requestNextPage();
     }
 

@@ -34,7 +34,6 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
-import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.ExoPlayer.PreloadConfiguration;
@@ -63,6 +62,7 @@ import mulin.tvdy.auth.LoginStatusChecker;
 import mulin.tvdy.auth.QrCodeGenerator;
 import mulin.tvdy.data.FeedRepository;
 import mulin.tvdy.data.FeedVideo;
+import mulin.tvdy.data.WatchedAwemeStore;
 import mulin.tvdy.pump.FeedPumpController;
 
 /**
@@ -110,6 +110,8 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private static final long STARTUP_TIMEOUT_PHONE_MS = 45_000;
     private static final long STARTUP_TIMEOUT_TV_MS = 120_000;
     private static final int MAX_STARTUP_RETRIES = 3;
+    /** Minimum play time before a skipped video counts as "watched" for filtering. */
+    private static final long WATCHED_THRESHOLD_MS = 3_000;
     private static final int HASHTAG_COLOR = Color.parseColor("#7CB2FF");
     private static final Pattern HASHTAG_PATTERN = Pattern.compile("#[^\\s#]+");
 
@@ -140,6 +142,8 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      * {@link #refillPlaylist}) since they can no longer be navigated back to.
      */
     private final Map<String, Long> resumePositions = new HashMap<>();
+    /** Next index into {@link FeedVideo#playUrlCandidates} to try after CDN 403. */
+    private final Map<String, Integer> playUrlCandidateIndex = new HashMap<>();
 
     private FeedPumpController pump;
     private ExoPlayer player;
@@ -263,6 +267,8 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         makeCircular(avatarImage);
         makeCircular(featureMenuLoginAvatar);
 
+        WatchedAwemeStore.getInstance().init(this);
+
         // Only re-verify a saved session on startup; anonymous use is the
         // default and never prompts the user to log in.
         if (hasSavedSession()) {
@@ -291,14 +297,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             }
         });
         pump.start((ViewGroup) findViewById(R.id.playerRoot));
+        if (hasSavedSession()) {
+            pump.setLoggedIn(true);
+        }
 
-        // The CDN serving play_addr direct links rejects requests with no
-        // Referer/User-Agent (or the wrong ones) - same identity the pump
-        // WebView presents itself with.
-        DefaultHttpDataSource.Factory httpDataSourceFactory = new DefaultHttpDataSource.Factory()
-                .setUserAgent(DouyinConstants.DESKTOP_USER_AGENT)
-                .setDefaultRequestProperties(Collections.singletonMap("Referer", DouyinConstants.REFERER))
-                .setAllowCrossProtocolRedirects(true);
+        // Session cookies are injected per-request in DouyinHttpDataSource.
+        DouyinHttpDataSource.Factory httpDataSourceFactory = new DouyinHttpDataSource.Factory();
 
         player = new ExoPlayer.Builder(this, buildRenderersFactory())
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(httpDataSourceFactory))
@@ -325,6 +329,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         player.addListener(new Player.Listener() {
             @Override
             public void onPlaybackStateChanged(int playbackState) {
+                if (playbackState == Player.STATE_READY && splashVisible && !playlist.isEmpty()) {
+                    hideSplashIfNeeded();
+                }
                 if (playbackState == Player.STATE_ENDED) {
                     playNext();
                 } else {
@@ -360,13 +367,15 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             public void onRenderedFirstFrame() {
                 coverImage.animate().alpha(0f).setDuration(180).start();
                 hideSplashIfNeeded();
+                if (pump != null) pump.notifyPlaybackStarted();
             }
 
             @Override
             public void onPlayerError(@NonNull PlaybackException error) {
                 Log.w(TAG, "playback error for " + (current != null ? current.awemeId : "?")
-                        + " url=" + (current != null ? current.playUrl : "?")
+                        + " url=" + playbackUrlFor(current)
                         + " errorCode=" + error.errorCode, error);
+                if (retryCurrentWithNextCandidate()) return;
                 playNext();
             }
         });
@@ -442,6 +451,11 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         playlistIndex = 0;
         refillPlaylist();
         applyCurrentUi();
+        Log.d(TAG, "startInitialPlayback awemeId=" + current.awemeId
+                + " bufferRemaining=" + repository.bufferSize()
+                + " cookieLen=" + DouyinConstants.playbackCookieLength()
+                + " candidates=" + current.playUrlCandidates.size()
+                + " url=" + playbackUrlFor(current));
         player.prepare();
         player.setPlayWhenReady(true);
         player.play();
@@ -509,6 +523,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             @Override
             public void onResult(boolean loggedIn, String nickname, String avatarUrl) {
                 setLoginState(loggedIn, nickname, avatarUrl);
+                if (loggedIn && pump != null) pump.scheduleWatchHistorySync();
             }
 
             @Override
@@ -550,13 +565,35 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private void retryStartup() {
         startupTimedOut = false;
-        waitingForBuffer = true;
-        autoStartWhenReady = true;
+        updateSplashStatus("正在重新加载…");
+        resetPlaybackAndFeed();
+    }
+
+    /**
+     * Clears all locally buffered feed items and playback state, then
+     * rebuilds the hidden pump WebView so the next fetch uses the current
+     * CookieManager session (anonymous vs logged-in).
+     */
+    private void resetPlaybackAndFeed() {
+        repository.reset();
         playlist.clear();
         playlistIndex = -1;
-        updateSplashStatus("正在重新加载…");
+        current = null;
+        resumePositions.clear();
+        pendingAdvance = 0;
+        waitingForBuffer = true;
+        autoStartWhenReady = true;
+        if (player != null) {
+            player.stop();
+            player.clearMediaItems();
+        }
+        coverImage.setAlpha(1f);
         scheduleStartupTimeout();
+        pump.setLoggedIn(loggedIn);
         pump.hardRestart();
+        if (loggedIn) {
+            pump.scheduleWatchHistorySync();
+        }
         updatePlaybackChrome();
     }
 
@@ -953,6 +990,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         this.loggedIn = loggedIn;
         this.loggedInNickname = loggedIn ? nickname : null;
         this.loggedInAvatarUrl = loggedIn ? avatarUrl : null;
+        if (pump != null) {
+            pump.setLoggedIn(loggedIn);
+        }
+        WatchedAwemeStore.getInstance().bindSession();
         if (loggedIn) {
             featureMenuLoginText.setText(
                     loggedInNickname != null && !loggedInNickname.isEmpty() ? loggedInNickname : "已登录");
@@ -971,11 +1012,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      * CookieImportHelper#clear}), reverts the row back to "登录账号", and
      * reloads the feed so the pump WebView's next fetch goes out as an
      * anonymous session instead of continuing to ride the now-cleared one.
+     * {@link #resetPlaybackAndFeed()} clears any videos buffered under the
+     * old session so they are not played after logout.
      */
     private void logout() {
         CookieImportHelper.clear();
         setLoginState(false, null, null);
-        pump.reloadFeed();
+        resetPlaybackAndFeed();
         Toast.makeText(this, "已退出登录", Toast.LENGTH_SHORT).show();
     }
 
@@ -1058,7 +1101,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                     setLoginState(true, nickname, avatarUrl);
                     handoffStatusText.setTextColor(0xFF69F0AE);
                     handoffStatusText.setText("登录成功：" + nickname);
-                    pump.reloadFeed();
+                    resetPlaybackAndFeed();
                     // Leave the confirmed result on screen briefly instead of
                     // yanking the overlay away the instant it appears.
                     handler.postDelayed(PlayerActivity.this::hideCookieLogin, 1500);
@@ -1099,7 +1142,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 return;
             }
             playlist.add(next);
-            player.addMediaItem(MediaItem.fromUri(next.playUrl));
+            player.addMediaItem(mediaItemFor(next));
         }
         waitingForBuffer = false;
         pendingAdvance = 0;
@@ -1110,6 +1153,45 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (playlistIndex <= 0) return;
         pendingAdvance = 0;
         advance(-1);
+    }
+
+    private MediaItem mediaItemFor(FeedVideo video) {
+        for (String url : video.playUrlCandidates) {
+            DouyinPlaybackRegistry.register(url, video.awemeId);
+        }
+        return MediaItem.fromUri(playbackUrlFor(video))
+                .buildUpon()
+                .setMediaId(video.awemeId)
+                .build();
+    }
+
+    private String playbackUrlFor(FeedVideo video) {
+        if (video == null) return "";
+        int idx = playUrlCandidateIndex.getOrDefault(video.awemeId, 0);
+        if (idx >= 0 && idx < video.playUrlCandidates.size()) {
+            return video.playUrlCandidates.get(idx);
+        }
+        return video.playUrl;
+    }
+
+    /** Tries the next CDN mirror when the current one returns HTTP 403. */
+    private boolean retryCurrentWithNextCandidate() {
+        if (current == null || player == null || playlistIndex < 0) return false;
+        int nextIdx = playUrlCandidateIndex.getOrDefault(current.awemeId, 0) + 1;
+        if (nextIdx >= current.playUrlCandidates.size()) return false;
+        playUrlCandidateIndex.put(current.awemeId, nextIdx);
+        String altUrl = current.playUrlCandidates.get(nextIdx);
+        DouyinPlaybackRegistry.register(altUrl, current.awemeId);
+        Log.w(TAG, "retry awemeId=" + current.awemeId + " candidate=" + nextIdx
+                + "/" + current.playUrlCandidates.size() + " url=" + altUrl);
+        player.replaceMediaItem(playlistIndex, MediaItem.fromUri(altUrl)
+                .buildUpon()
+                .setMediaId(current.awemeId)
+                .build());
+        player.seekTo(playlistIndex, 0);
+        player.prepare();
+        player.setPlayWhenReady(true);
+        return true;
     }
 
     /**
@@ -1130,7 +1212,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private void handleAutoAdvance() {
         int newIndex = player.getCurrentMediaItemIndex();
         if (newIndex == playlistIndex || newIndex < 0 || newIndex >= playlist.size()) return;
-        if (current != null) resumePositions.remove(current.awemeId);
+        if (current != null) {
+            resumePositions.remove(current.awemeId);
+            markVideoFullyWatched(current);
+        }
         playlistIndex = newIndex;
         refillPlaylist();
         Long resumeMs = resumePositions.get(playlist.get(playlistIndex).awemeId);
@@ -1202,7 +1287,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             FeedVideo next = repository.pollNext();
             if (next == null) break;
             playlist.add(next);
-            player.addMediaItem(MediaItem.fromUri(next.playUrl));
+            player.addMediaItem(mediaItemFor(next));
         }
         while (playlistIndex > HISTORY_KEEP) {
             FeedVideo dropped = playlist.remove(0);
@@ -1221,13 +1306,33 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private void rememberCurrentPosition() {
         if (current == null || player == null) return;
         long duration = player.getDuration();
+        long position = player.getCurrentPosition();
         boolean finished = player.getPlaybackState() == Player.STATE_ENDED
-                || (duration != C.TIME_UNSET && duration > 0 && player.getCurrentPosition() >= duration - 500);
+                || (duration != C.TIME_UNSET && duration > 0 && position >= duration - 500);
         if (finished) {
             resumePositions.remove(current.awemeId);
+            markVideoFullyWatched(current);
         } else {
-            resumePositions.put(current.awemeId, player.getCurrentPosition());
+            if (position >= WATCHED_THRESHOLD_MS
+                    || (duration != C.TIME_UNSET && duration > 0 && position >= duration * 0.3)) {
+                markVideoPartiallyWatched(current, position);
+            }
+            resumePositions.put(current.awemeId, position);
         }
+    }
+
+    private void markVideoFullyWatched(FeedVideo video) {
+        repository.markConsumed(video.awemeId);
+        if (loggedIn && player != null) {
+            long duration = player.getDuration();
+            long playMs = duration != C.TIME_UNSET && duration > 0 ? duration : WATCHED_THRESHOLD_MS;
+            pump.reportPlay(video.awemeId, playMs);
+        }
+    }
+
+    private void markVideoPartiallyWatched(FeedVideo video, long playMs) {
+        repository.markConsumed(video.awemeId);
+        if (loggedIn) pump.reportPlay(video.awemeId, playMs);
     }
 
     private void applyCurrentUi() {

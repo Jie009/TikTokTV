@@ -27,28 +27,24 @@ import androidx.webkit.WebViewFeature;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 import mulin.tvdy.DeviceUtils;
 import mulin.tvdy.DouyinConstants;
 import mulin.tvdy.data.FeedRepository;
 import mulin.tvdy.data.PageRequester;
+import mulin.tvdy.data.WatchedAwemeStore;
 
 /**
  * Owns the hidden "data pump" WebView: loads the real douyin.com page once,
  * keeps it alive for as long as the host Activity lives, hooks fetch/XHR to
  * capture the signed feed responses the page fetches for itself, and feeds
  * parsed items into {@link FeedRepository}.
+ * <p>
+ * After the first successful feed capture, pagination is triggered by nudging
+ * the page to scroll so it fetches the next batch with a valid Argus signature.
  */
 public final class FeedPumpController implements PageRequester {
 
@@ -58,6 +54,8 @@ public final class FeedPumpController implements PageRequester {
     private static final long[] KICKSTART_DELAYS_TV_MS = {800, 2_000, 5_000, 10_000, 20_000, 35_000, 50_000};
     /** If {@code onPageFinished} never fires (common on slow TV WebViews), kick anyway. */
     private static final long PAGE_INTERACTIVE_FALLBACK_MS = 20_000;
+    private static final long PROACTIVE_FETCH_TIMEOUT_MS = 15_000;
+    private static final long SCROLL_FALLBACK_COOLDOWN_MS = 5_000;
 
     public interface Listener {
         void onPumpStatus(String message);
@@ -70,8 +68,7 @@ public final class FeedPumpController implements PageRequester {
     private final FeedRepository repository = FeedRepository.getInstance();
     private final boolean television;
     private final long[] kickstartDelays;
-    private final ExecutorService networkExecutor = Executors.newSingleThreadExecutor();
-
+    private final List<Runnable> kickstartRunnables = new ArrayList<>();
     private ViewGroup container;
     private WebView webView;
     private Listener listener;
@@ -79,9 +76,20 @@ public final class FeedPumpController implements PageRequester {
     private int kickstartGeneration = 0;
     private int apiCallsSeen = 0;
     private boolean pageInteractive = false;
-    private final List<Runnable> kickstartRunnables = new ArrayList<>();
+    private final FeedPaginationState paginationState = new FeedPaginationState();
     private Runnable hookTicker;
     private Runnable pageInteractiveFallback;
+    private Runnable proactiveFetchTimeout;
+    private boolean signedFetchInFlight = false;
+    private boolean historyFetchInFlight = false;
+    private long lastScrollFallbackAt = 0;
+    private boolean loggedIn = false;
+    private boolean historySyncRequested = false;
+    private boolean pendingHistorySync = false;
+    private boolean playbackStartedNotified = false;
+    private long historyCursor = 0;
+    private int historyPagesFetched = 0;
+    private static final int MAX_HISTORY_PAGES = 5;
 
     public FeedPumpController(Activity host) {
         this.host = host;
@@ -91,6 +99,43 @@ public final class FeedPumpController implements PageRequester {
 
     public void setListener(Listener listener) {
         this.listener = listener;
+    }
+
+    /** When {@code true}, kickstarts use a signed cold feed + history sync. */
+    public void setLoggedIn(boolean loggedIn) {
+        this.loggedIn = loggedIn;
+        if (loggedIn) {
+            WatchedAwemeStore.getInstance().bindSession();
+        }
+    }
+
+    /** Pulls account watch history into {@link WatchedAwemeStore} after login. */
+    public void syncWatchHistory() {
+        historySyncRequested = true;
+        historyCursor = 0;
+        historyPagesFetched = 0;
+        pendingHistorySync = false;
+    }
+
+    /**
+     * Defers {@link #syncWatchHistory()} until {@link #notifyPlaybackStarted()}
+     * so the watched-id filter does not empty the first feed batch.
+     */
+    public void scheduleWatchHistorySync() {
+        pendingHistorySync = true;
+        if (playbackStartedNotified && loggedIn && !historySyncRequested) {
+            handler.postDelayed(() -> {
+                if (!loggedIn || historySyncRequested) return;
+                syncWatchHistory();
+                fetchNextHistoryPage();
+            }, 1_000);
+        }
+    }
+
+    /** Reports playback to Douyin so future feed requests exclude watched items. */
+    public void reportPlay(String awemeId, long playMs) {
+        if (webView == null || awemeId == null || awemeId.isEmpty()) return;
+        webView.evaluateJavascript(FeedHookScripts.buildReportPlayScript(awemeId, playMs), null);
     }
 
     public void start(ViewGroup container) {
@@ -113,8 +158,8 @@ public final class FeedPumpController implements PageRequester {
         cancelKickstart();
         stopHookTicker();
         cancelPageInteractiveFallback();
+        cancelProactiveFetchTimeout();
         handler.removeCallbacksAndMessages(null);
-        networkExecutor.shutdownNow();
         if (webView != null) {
             container.removeView(webView);
             webView.destroy();
@@ -125,7 +170,73 @@ public final class FeedPumpController implements PageRequester {
     @Override
     public void requestNextPage() {
         if (webView == null) return;
-        webView.evaluateJavascript(FeedHookScripts.TRIGGER_INITIAL_FEED, null);
+        if (paginationState.isReady()) {
+            int nextIndex = paginationState.getRefreshIndex();
+            Log.d(TAG, "proactive pagination refresh_index=" + nextIndex);
+            notifyStatus("正在加载更多视频…");
+            scheduleScrollPaginationTimeout();
+            String script = FeedHookScripts.buildProactiveFetchScript(
+                    paginationState.getLastFeedUrl(),
+                    paginationState.getMaxCursor(),
+                    nextIndex);
+            webView.evaluateJavascript(script, null);
+            scheduleScrollPaginationFallback();
+        } else if (loggedIn && pageInteractive && !historySyncRequested && !signedFetchInFlight) {
+            webView.evaluateJavascript(FeedHookScripts.SIGNER_READY, value -> {
+                if (webView == null) return;
+                if ("true".equals(value)) {
+                    runSignedColdFeed();
+                } else {
+                    Log.d(TAG, "signer not ready, scroll kickstart");
+                    repository.releasePageRequest();
+                    webView.evaluateJavascript(FeedHookScripts.TRIGGER_INITIAL_FEED, null);
+                }
+            });
+        } else {
+            Log.d(TAG, "passive kickstart (anonymous / pagination not ready)");
+            webView.evaluateJavascript(FeedHookScripts.TRIGGER_INITIAL_FEED, null);
+            repository.releasePageRequest();
+        }
+    }
+
+    private void runSignedColdFeed() {
+        Log.d(TAG, "signed cold feed (logged in)");
+        notifyStatus("正在拉取账号推荐…");
+        signedFetchInFlight = true;
+        scheduleScrollPaginationTimeout();
+        webView.evaluateJavascript(FeedHookScripts.buildFreshFeedScript(), null);
+    }
+
+    private Runnable scrollPaginationFallback;
+
+    private void scheduleScrollPaginationFallback() {
+        if (scrollPaginationFallback != null) {
+            handler.removeCallbacks(scrollPaginationFallback);
+        }
+        scrollPaginationFallback = () -> {
+            if (webView == null || repository.bufferSize() >= 5) return;
+            Log.d(TAG, "scroll pagination fallback");
+            webView.evaluateJavascript(FeedHookScripts.TRIGGER_PAGE_FEED, null);
+        };
+        handler.postDelayed(scrollPaginationFallback, 5_000);
+    }
+
+    private void cancelScrollPaginationFallback() {
+        if (scrollPaginationFallback != null) {
+            handler.removeCallbacks(scrollPaginationFallback);
+            scrollPaginationFallback = null;
+        }
+    }
+
+    public void notifyPlaybackStarted() {
+        if (playbackStartedNotified) return;
+        playbackStartedNotified = true;
+        if (!loggedIn || historySyncRequested) return;
+        handler.postDelayed(() -> {
+            if (!loggedIn || historySyncRequested) return;
+            syncWatchHistory();
+            fetchNextHistoryPage();
+        }, 3_000);
     }
 
     public void reloadFeed() {
@@ -153,6 +264,27 @@ public final class FeedPumpController implements PageRequester {
     private void resetPumpSession() {
         apiCallsSeen = 0;
         pageInteractive = false;
+        paginationState.reset();
+        cancelProactiveFetchTimeout();
+        cancelScrollPaginationFallback();
+        signedFetchInFlight = false;
+        historyFetchInFlight = false;
+        historySyncRequested = false;
+        historyCursor = 0;
+        historyPagesFetched = 0;
+        pendingHistorySync = false;
+        playbackStartedNotified = false;
+    }
+
+    private void fetchNextHistoryPage() {
+        if (!historySyncRequested || webView == null) return;
+        if (historyPagesFetched >= MAX_HISTORY_PAGES) {
+            historySyncRequested = false;
+            return;
+        }
+        Log.d(TAG, "fetching watch history page cursor=" + historyCursor);
+        historyFetchInFlight = true;
+        webView.evaluateJavascript(FeedHookScripts.buildFetchHistoryScript(historyCursor), null);
     }
 
     @SuppressWarnings("SetJavaScriptEnabled")
@@ -175,7 +307,6 @@ public final class FeedPumpController implements PageRequester {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
-        settings.setDatabaseEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(true);
         settings.setUserAgentString(DouyinConstants.DESKTOP_USER_AGENT);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
@@ -240,9 +371,6 @@ public final class FeedPumpController implements PageRequester {
                     String url = request.getUrl().toString();
                     if (isFeedApiUrl(url)) {
                         handler.post(() -> apiCallsSeen++);
-                        if ("GET".equalsIgnoreCase(request.getMethod())) {
-                            mirrorGetFeedRequest(url, request);
-                        }
                     }
                 }
                 return super.shouldInterceptRequest(view, request);
@@ -315,6 +443,36 @@ public final class FeedPumpController implements PageRequester {
         }
     }
 
+    private void scheduleScrollPaginationTimeout() {
+        cancelProactiveFetchTimeout();
+        proactiveFetchTimeout = () -> {
+            Log.w(TAG, "page feed request timeout");
+            signedFetchInFlight = false;
+            repository.releasePageRequest();
+        };
+        handler.postDelayed(proactiveFetchTimeout, PROACTIVE_FETCH_TIMEOUT_MS);
+    }
+
+    private void cancelProactiveFetchTimeout() {
+        if (proactiveFetchTimeout != null) {
+            handler.removeCallbacks(proactiveFetchTimeout);
+            proactiveFetchTimeout = null;
+        }
+    }
+
+    private void fallbackToScrollTrigger(String reason) {
+        long now = System.currentTimeMillis();
+        if (now - lastScrollFallbackAt < SCROLL_FALLBACK_COOLDOWN_MS) {
+            Log.d(TAG, "scroll fallback suppressed (" + reason + ")");
+            return;
+        }
+        lastScrollFallbackAt = now;
+        Log.d(TAG, "scroll fallback: " + reason);
+        if (webView != null) {
+            webView.evaluateJavascript(FeedHookScripts.TRIGGER_INITIAL_FEED, null);
+        }
+    }
+
     private void markPageInteractive(String status) {
         if (pageInteractive) return;
         pageInteractive = true;
@@ -345,50 +503,14 @@ public final class FeedPumpController implements PageRequester {
 
     private static boolean isFeedApiUrl(String url) {
         if (url == null || !url.contains("douyin.com")) return false;
-        return url.contains("/aweme/") && (url.contains("feed") || url.contains("module"));
+        if (url.contains("/history/")) return false;
+        return url.contains("/tab/feed")
+                || url.contains("/module/feed")
+                || (url.contains("/aweme/") && url.contains("/feed"));
     }
 
-    private void mirrorGetFeedRequest(String url, WebResourceRequest request) {
-        networkExecutor.execute(() -> {
-            HttpURLConnection connection = null;
-            try {
-                connection = (HttpURLConnection) new URL(url).openConnection();
-                connection.setRequestMethod("GET");
-                connection.setConnectTimeout(15_000);
-                connection.setReadTimeout(20_000);
-                connection.setInstanceFollowRedirects(true);
-                connection.setRequestProperty("User-Agent", DouyinConstants.DESKTOP_USER_AGENT);
-                connection.setRequestProperty("Referer", DouyinConstants.REFERER);
-                String cookie = CookieManager.getInstance().getCookie(url);
-                if (cookie != null) {
-                    connection.setRequestProperty("Cookie", cookie);
-                }
-                Map<String, String> headers = request.getRequestHeaders();
-                if (headers != null) {
-                    for (Map.Entry<String, String> entry : headers.entrySet()) {
-                        if (entry.getKey() != null && entry.getValue() != null) {
-                            connection.setRequestProperty(entry.getKey(), entry.getValue());
-                        }
-                    }
-                }
-                int code = connection.getResponseCode();
-                InputStream stream = code >= 400 ? connection.getErrorStream() : connection.getInputStream();
-                if (stream == null) return;
-                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                byte[] chunk = new byte[8192];
-                int read;
-                while ((read = stream.read(chunk)) != -1) {
-                    buffer.write(chunk, 0, read);
-                }
-                String body = buffer.toString(StandardCharsets.UTF_8.name());
-                Log.d(TAG, "mirrored GET feed response code=" + code + " bytes=" + body.length());
-                handler.post(() -> handleFeedData(url, body));
-            } catch (Exception e) {
-                Log.w(TAG, "mirror GET feed failed for " + url, e);
-            } finally {
-                if (connection != null) connection.disconnect();
-            }
-        });
+    private static boolean isHistoryApiUrl(String url) {
+        return url != null && url.contains("douyin.com") && url.contains("history/read");
     }
 
     private void installDocumentStartHooks() {
@@ -431,7 +553,6 @@ public final class FeedPumpController implements PageRequester {
         Log.d(TAG, "feed kickstart attempt " + attempt + " apiCallsSeen=" + apiCallsSeen);
         injectHooks();
         requestNextPage();
-        repository.kickstartPaging();
         probePageState();
 
         if (attempt == 2) {
@@ -501,6 +622,51 @@ public final class FeedPumpController implements PageRequester {
         public void onPageProbe(final String json) {
             handler.post(() -> handlePageProbe(json));
         }
+
+        @JavascriptInterface
+        public void onProactiveFetchOk(final String url) {
+            handler.post(() -> {
+                cancelProactiveFetchTimeout();
+                signedFetchInFlight = false;
+                Log.d(TAG, "signed cold feed dispatched: " + url);
+            });
+        }
+
+        @JavascriptInterface
+        public void onProactiveFetchFailed(final String reason) {
+            handler.post(() -> handleProactiveFetchFailed(reason));
+        }
+
+        @JavascriptInterface
+        public void onHistoryData(final String url, final String json) {
+            handler.post(() -> handleHistoryData(url, json));
+        }
+    }
+
+    private void handleProactiveFetchFailed(String reason) {
+        if (historyFetchInFlight) {
+            historyFetchInFlight = false;
+            Log.w(TAG, "history fetch failed: " + reason);
+            return;
+        }
+        cancelProactiveFetchTimeout();
+        cancelScrollPaginationFallback();
+        signedFetchInFlight = false;
+        Log.w(TAG, "proactive fetch failed: " + reason + ", falling back to scroll");
+        repository.releasePageRequest();
+        if (webView != null) {
+            webView.evaluateJavascript(FeedHookScripts.TRIGGER_PAGE_FEED, null);
+        }
+    }
+
+    private void handleHistoryData(String url, String json) {
+        historyFetchInFlight = false;
+        if (json == null || json.isEmpty() || !json.trim().startsWith("{")) return;
+        try {
+            handleHistoryData(url, new JSONObject(json.trim()));
+        } catch (Exception e) {
+            Log.w(TAG, "history data parse failed", e);
+        }
     }
 
     private void handlePageProbe(String json) {
@@ -522,12 +688,41 @@ public final class FeedPumpController implements PageRequester {
 
     private void handleFeedData(String url, String json) {
         if (json == null || json.isEmpty()) return;
+        String trimmed = json.trim();
+        if (!trimmed.startsWith("{")) {
+            Log.w(TAG, "non-JSON feed payload from " + url + ": "
+                    + trimmed.substring(0, Math.min(trimmed.length(), 40)));
+            if (isFeedApiUrl(url)) {
+                signedFetchInFlight = false;
+                repository.releasePageRequest();
+            }
+            return;
+        }
         try {
-            JSONObject root = new JSONObject(json);
+            JSONObject root = new JSONObject(trimmed);
+            cancelProactiveFetchTimeout();
+            cancelScrollPaginationFallback();
+            signedFetchInFlight = false;
+
+            if (isHistoryApiUrl(url)) {
+                handleHistoryData(url, root);
+                return;
+            }
+
+            if (!isFeedApiUrl(url)) {
+                return;
+            }
+
+            paginationState.updateFromCapture(url, root);
+
             JSONArray list = root.optJSONArray("aweme_list");
             if (list == null) {
                 Log.d(TAG, "no aweme_list in payload from " + url
                         + " status_code=" + root.optInt("status_code", -1));
+                repository.releasePageRequest();
+                if (paginationState.hasMore() && webView != null) {
+                    webView.evaluateJavascript(FeedHookScripts.TRIGGER_PAGE_FEED, null);
+                }
                 return;
             }
             cancelKickstart();
@@ -536,6 +731,29 @@ public final class FeedPumpController implements PageRequester {
             repository.addAwemeList(list);
         } catch (Exception e) {
             Log.e(TAG, "failed to parse feed json from " + url, e);
+            repository.releasePageRequest();
         }
+    }
+
+    private void handleHistoryData(String url, JSONObject root) {
+        JSONArray list = root.optJSONArray("aweme_list");
+        if (list != null && list.length() > 0) {
+            WatchedAwemeStore.getInstance().ingestHistoryList(list);
+            Log.d(TAG, "history sync: +" + list.length()
+                    + " ids, storeSize=" + WatchedAwemeStore.getInstance().size());
+        }
+        historyPagesFetched++;
+        if (root.has("max_cursor")) {
+            long next = root.optLong("max_cursor", 0);
+            boolean hasMore = root.optInt("has_more", 0) != 0;
+            if (hasMore && next > 0 && next != historyCursor
+                    && historyPagesFetched < MAX_HISTORY_PAGES) {
+                historyCursor = next;
+                fetchNextHistoryPage();
+                return;
+            }
+        }
+        historySyncRequested = false;
+        Log.d(TAG, "history sync complete, pages=" + historyPagesFetched);
     }
 }
