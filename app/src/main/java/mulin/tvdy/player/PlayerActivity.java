@@ -102,6 +102,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private static final long PRELOAD_PAUSE_SETTLE_MS = 3_000;
     private static final int HISTORY_KEEP = 3;
     private static final long SEEK_STEP_MS = 5_000;
+    /** Delay before repeated seeks begin while a direction key is held. */
+    private static final long SEEK_REPEAT_INITIAL_MS = 400;
+    /** Interval between repeated seeks while the key stays down. */
+    private static final long SEEK_REPEAT_INTERVAL_MS = 300;
     private static final int SLIDE_DURATION_MS = 220;
     private static final long CONTROLS_AUTO_HIDE_MS = 3_000;
     private static final long CENTER_LONG_PRESS_MS = 500;
@@ -212,6 +216,16 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private final Runnable startupTimeoutRunnable = this::onStartupTimeout;
     private final Runnable longPressRunnable = this::openFeatureMenu;
     private final Runnable capPreloadWhilePausedRunnable = this::capPreloadWhilePaused;
+    private long seekRepeatDeltaMs = 0;
+    private final Runnable seekRepeatRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (seekRepeatDeltaMs == 0) return;
+            seekBy(seekRepeatDeltaMs);
+            showControls();
+            handler.postDelayed(this, SEEK_REPEAT_INTERVAL_MS);
+        }
+    };
     private final Runnable progressTick = new Runnable() {
         @Override
         public void run() {
@@ -696,6 +710,21 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             return true;
         }
 
+        if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (event.getRepeatCount() == 0) {
+                    startSeekRepeat(keyCode == KeyEvent.KEYCODE_DPAD_LEFT
+                            ? -SEEK_STEP_MS : SEEK_STEP_MS);
+                }
+                return true;
+            }
+            if (event.getAction() == KeyEvent.ACTION_UP) {
+                stopSeekRepeat();
+                return true;
+            }
+            return true;
+        }
+
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
             switch (keyCode) {
                 case KeyEvent.KEYCODE_DPAD_DOWN:
@@ -703,14 +732,6 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                     return true;
                 case KeyEvent.KEYCODE_DPAD_UP:
                     playPrevious();
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                    seekBy(-SEEK_STEP_MS);
-                    showControls();
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    seekBy(SEEK_STEP_MS);
-                    showControls();
                     return true;
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
                 case KeyEvent.KEYCODE_SPACE:
@@ -884,6 +905,20 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         if (target < 0) target = 0;
         if (duration != C.TIME_UNSET && target > duration) target = duration;
         player.seekTo(target);
+    }
+
+    /** First seek fires immediately; further seeks repeat while the key is held. */
+    private void startSeekRepeat(long deltaMs) {
+        seekRepeatDeltaMs = deltaMs;
+        handler.removeCallbacks(seekRepeatRunnable);
+        seekBy(deltaMs);
+        showControls();
+        handler.postDelayed(seekRepeatRunnable, SEEK_REPEAT_INITIAL_MS);
+    }
+
+    private void stopSeekRepeat() {
+        seekRepeatDeltaMs = 0;
+        handler.removeCallbacks(seekRepeatRunnable);
     }
 
     private void showControls() {
