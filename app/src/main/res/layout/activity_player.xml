@@ -1,0 +1,520 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/playerRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <FrameLayout
+        android:id="@+id/contentContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <!-- Fills the pillarbox bars either side of a vertical video (this
+             layout is forced landscape for TV, but douyin content is almost
+             always 9:16) with a blurred, zoomed copy of that video's own
+             cover art instead of plain black. Sits behind everything else
+             and, unlike coverImage below, is never faded out - the sharp
+             video only ever covers its own correctly-fitted rect (see
+             playerView's app:resize_mode="fit"), leaving this visible in the
+             leftover space for as long as this video is on screen. -->
+        <ImageView
+            android:id="@+id/backdropImage"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#000000"
+            android:scaleType="centerCrop"
+            android:alpha="0.55"
+            android:contentDescription="@null" />
+
+        <ImageView
+            android:id="@+id/coverImage"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#000000"
+            android:scaleType="centerCrop"
+            android:contentDescription="@null" />
+
+        <androidx.media3.ui.PlayerView
+            android:id="@+id/playerView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@android:color/transparent"
+            app:surface_type="texture_view"
+            app:use_controller="false"
+            app:resize_mode="fit" />
+
+        <!-- Auto-hiding chrome: title + author at top, time/progress/stats at
+             bottom. Both panels are shown/hidden together (see
+             PlayerActivity#showControls/#hideControls) driven by
+             remote-control input rather than touch. -->
+
+        <LinearLayout
+            android:id="@+id/topPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top"
+            android:orientation="vertical"
+            android:paddingStart="28dp"
+            android:paddingEnd="28dp"
+            android:paddingTop="22dp"
+            android:paddingBottom="36dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/titleText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:shadowColor="#CC000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="4"
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:id="@+id/authorRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:id="@+id/avatarImage"
+                    android:layout_width="28dp"
+                    android:layout_height="28dp"
+                    android:background="#33FFFFFF"
+                    android:scaleType="centerCrop"
+                    android:contentDescription="@null" />
+
+                <TextView
+                    android:id="@+id/authorText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/bottomPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:orientation="vertical"
+            android:paddingStart="28dp"
+            android:paddingEnd="28dp"
+            android:paddingTop="36dp"
+            android:paddingBottom="24dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/positionText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_marginEnd="6dp"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:text="/"
+                    android:textColor="#B3FFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/durationText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:textColor="#B3FFFFFF"
+                    android:textSize="13sp" />
+
+            </LinearLayout>
+
+            <ProgressBar
+                android:id="@+id/seekProgress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="4dp"
+                android:layout_marginTop="10dp"
+                android:max="1000"
+                android:progressDrawable="@drawable/seek_progress" />
+
+            <LinearLayout
+                android:id="@+id/statsRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="18dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:id="@+id/likeIcon"
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_like"
+                    android:contentDescription="@null" />
+
+                <TextView
+                    android:id="@+id/likeCount"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_marginEnd="24dp"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp" />
+
+                <ImageView
+                    android:id="@+id/commentIcon"
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_comment"
+                    android:contentDescription="@null" />
+
+                <TextView
+                    android:id="@+id/commentCount"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_marginEnd="24dp"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp" />
+
+                <ImageView
+                    android:id="@+id/collectIcon"
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_collect"
+                    android:contentDescription="@null" />
+
+                <TextView
+                    android:id="@+id/collectCount"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:shadowColor="#CC000000"
+                    android:shadowDx="0"
+                    android:shadowDy="1"
+                    android:shadowRadius="3"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+    </FrameLayout>
+
+    <!-- "Loading" spinner shown while the current item is buffering (see
+         PlayerActivity#showLoading). Play/pause is driven from there rather
+         than app:lottie_autoPlay, so it isn't burning frames while hidden
+         behind other videos that aren't buffering. -->
+    <com.airbnb.lottie.LottieAnimationView
+        android:id="@+id/loadingSpinner"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center"
+        android:visibility="gone"
+        app:lottie_loop="true"
+        app:lottie_rawRes="@raw/loading_spinner" />
+
+    <!-- Center pause indicator shown while playback is deliberately
+         paused (see PlayerActivity#updatePauseIconVisibility). -->
+    <FrameLayout
+        android:id="@+id/pauseIcon"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:layout_gravity="center"
+        android:background="@drawable/bg_pause_circle"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_gravity="center"
+            android:src="@drawable/ic_pause"
+            android:contentDescription="@null" />
+
+    </FrameLayout>
+
+    <!-- Placeholder long-press ("start" held down) feature list: account
+         login, like, follow, comments, etc. will eventually live here. Only
+         the shell + open/close (via back) is wired up for now. -->
+    <LinearLayout
+        android:id="@+id/featureMenu"
+        android:layout_width="260dp"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@drawable/bg_menu_panel"
+        android:orientation="vertical"
+        android:padding="8dp"
+        android:visibility="gone">
+
+        <!-- Default state ("登录账号", no avatar) opens
+             PlayerActivity#startCookieLogin's QR/Cookie overlay - the only
+             login method the app offers, since douyin's own web login (QR
+             modal or otherwise) is guarded by an anti-bot captcha a hidden
+             WebView can never solve. Once PlayerActivity#setLoginState
+             confirms a real session (via LoginStatusChecker), this row
+             instead shows that account's avatar + nickname, and selecting
+             it logs out (PlayerActivity#logout) rather than reopening the
+             login flow. -->
+        <LinearLayout
+            android:id="@+id/featureMenuLogin"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="18dp"
+            android:paddingTop="11dp"
+            android:paddingEnd="18dp"
+            android:paddingBottom="11dp">
+
+            <ImageView
+                android:id="@+id/featureMenuLoginAvatar"
+                android:layout_width="30dp"
+                android:layout_height="30dp"
+                android:layout_marginEnd="10dp"
+                android:contentDescription="@null"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/featureMenuLoginText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="登录账号"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp" />
+
+        </LinearLayout>
+
+        <!-- Re-runs PlayerActivity#checkLoginStatus on demand - lets the user
+             confirm at any later point (e.g. days after logging in) whether
+             the session douyin's servers hold is still actually valid,
+             rather than only ever finding out passively when the feed
+             happens to look wrong. -->
+        <TextView
+            android:id="@+id/featureMenuCheckLogin"
+            style="@style/FeatureMenuItem"
+            android:text="检测登录状态" />
+
+        <TextView
+            android:id="@+id/featureMenuLike"
+            style="@style/FeatureMenuItem"
+            android:text="点赞" />
+
+        <TextView
+            android:id="@+id/featureMenuFollow"
+            style="@style/FeatureMenuItem"
+            android:text="关注作者" />
+
+        <TextView
+            android:id="@+id/featureMenuComments"
+            style="@style/FeatureMenuItem"
+            android:text="查看评论" />
+
+    </LinearLayout>
+
+    <!-- The only login UI the app offers: douyin's own web login (QR modal
+         or otherwise) is a JS-rendered page guarded by a slide-to-verify
+         anti-bot captcha that a hidden, never-shown WebView can never
+         solve, so there's no way to automate it from inside this app. The
+         user instead logs in once in any ordinary browser they already
+         have, copies the raw Cookie header/document.cookie string out of
+         that already-authenticated session, and pastes it here - applied
+         directly via CookieImportHelper without this app ever touching
+         douyin.com's login page itself. See PlayerActivity#startCookieLogin. -->
+    <FrameLayout
+        android:id="@+id/cookieLoginOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#E6000000"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="640dp"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:background="@drawable/bg_menu_panel"
+            android:padding="24dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="10dp"
+                android:text="扫码登录"
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <!-- Populated at runtime by PlayerActivity#startCookieLogin: a QR
+                 bitmap (via QrCodeGenerator) encoding CookieHandoffServer's
+                 URL, plus that same URL as text underneath as a fallback for
+                 typing it manually into a browser. This is the only way in -
+                 there's no on-TV text field, since typing a 200+ character
+                 Cookie with a remote's on-screen keyboard is painful; the
+                 phone/PC on the other end of the scan does the pasting
+                 instead. The row is hidden if no LAN address/port was
+                 available (e.g. no network), which leaves this dead in the
+                 water - see startCookieLogin. -->
+            <LinearLayout
+                android:id="@+id/handoffRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                android:background="#1AFFFFFF"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:padding="12dp"
+                android:visibility="gone">
+
+                <ImageView
+                    android:id="@+id/handoffQrImage"
+                    android:layout_width="140dp"
+                    android:layout_height="140dp"
+                    android:background="#FFFFFF"
+                    android:contentDescription="@null"
+                    android:padding="8dp" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="用手机摄像头/微信扫一扫，在手机上粘贴 Cookie 并提交"
+                        android:textColor="#FFFFFF"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/handoffUrlText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:textColor="#B3FFFFFF"
+                        android:textSize="12sp" />
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <!-- Populated by applyCookieAndFinish once CookieHandoffServer
+                 delivers a submission, so the user gets feedback right here
+                 on the TV without needing a Toast that might be missed. -->
+            <TextView
+                android:id="@+id/handoffStatusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                android:text="等待手机扫码提交…"
+                android:textColor="#FFD54F"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="4dp"
+                android:text="按返回键取消"
+                android:textColor="#80FFFFFF"
+                android:textSize="12sp" />
+
+        </LinearLayout>
+
+    </FrameLayout>
+
+    <!-- Startup splash: covers everything else from onCreate until the very
+         first video actually renders its first frame (see
+         PlayerActivity#onRenderedFirstFrame/hideSplashIfNeeded) - the feed
+         fetch plus that first video's own buffering both take a moment, and
+         this is friendlier than staring at a blank black screen for however
+         long that takes. Plays loading.json on loop and fades out only once
+         there's real content underneath ready to reveal, rather than on a
+         fixed timer that could still be showing over blank content or
+         disappear too early. -->
+    <FrameLayout
+        android:id="@+id/splashOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:clickable="true"
+        android:focusable="true">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <com.airbnb.lottie.LottieAnimationView
+                android:id="@+id/splashAnimation"
+                android:layout_width="180dp"
+                android:layout_height="180dp"
+                app:lottie_autoPlay="true"
+                app:lottie_loop="true"
+                app:lottie_rawRes="@raw/loading" />
+
+            <TextView
+                android:id="@+id/splashStatusText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:gravity="center"
+                android:text="初始化中，请稍等…"
+                android:textColor="#B3FFFFFF"
+                android:textSize="14sp" />
+
+        </LinearLayout>
+
+    </FrameLayout>
+
+</FrameLayout>

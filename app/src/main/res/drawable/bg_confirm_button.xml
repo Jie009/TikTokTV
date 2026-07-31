@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Accent-colored button background for cookieConfirmButton (see
+     activity_player.xml) - brightens on D-pad focus/press since this is a
+     TV app with no pointer to otherwise show where focus currently is. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#FF4D6D" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#FF4D6D" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#FE2C55" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+</selector>
