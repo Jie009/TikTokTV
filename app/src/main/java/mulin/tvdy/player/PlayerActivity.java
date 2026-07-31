@@ -130,6 +130,8 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     /** Max wait for the incoming video's first frame before starting the slide. */
     private static final long SLIDE_FRAME_WAIT_MS = 500;
     private static final long CONTROLS_AUTO_HIDE_MS = 3_000;
+    /** Window for the "press back again to exit" confirmation. */
+    private static final long EXIT_CONFIRM_MS = 2_000;
     private static final long CENTER_LONG_PRESS_MS = 500;
     private static final long PROGRESS_UPDATE_INTERVAL_MS = 500;
     /** If no video after this long, auto-retry (TV needs much longer than emulator). */
@@ -249,6 +251,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private boolean centerLongPressFired = false;
     /** See {@link #dispatchBackKey} for why this needs to survive across a single press's DOWN and UP. */
     private boolean backConsumedSpecially = false;
+    private long lastBackPressForExitMs = 0;
 
     private PlaybackMode playbackMode = PlaybackMode.FEED;
     private boolean creatorGridVisible = false;
@@ -907,7 +910,14 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 hideControls();
                 backConsumedSpecially = true;
             } else {
-                backConsumedSpecially = false;
+                backConsumedSpecially = true;
+                long now = System.currentTimeMillis();
+                if (now - lastBackPressForExitMs <= EXIT_CONFIRM_MS) {
+                    finish();
+                } else {
+                    lastBackPressForExitMs = now;
+                    Toast.makeText(this, "再按一次返回键退出应用", Toast.LENGTH_SHORT).show();
+                }
             }
         }
         if (backConsumedSpecially) {
