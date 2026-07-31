@@ -68,6 +68,8 @@ import mulin.tvdy.DeviceUtils;
 
 import mulin.tvdy.DouyinConstants;
 
+import mulin.tvdy.data.CreatorVideoRepository;
+
 import mulin.tvdy.data.FeedRepository;
 
 import mulin.tvdy.data.PageRequester;
@@ -163,6 +165,14 @@ public final class FeedPumpController implements PageRequester {
     private boolean pageInteractive = false;
 
     private final FeedPaginationState paginationState = new FeedPaginationState();
+
+    private final FeedPaginationState creatorPaginationState = new FeedPaginationState();
+
+    private final CreatorVideoRepository creatorRepository = CreatorVideoRepository.getInstance();
+
+    private boolean creatorMode = false;
+
+    private String activeCreatorSecUid;
 
     private Runnable hookTicker;
 
@@ -292,6 +302,8 @@ public final class FeedPumpController implements PageRequester {
 
         repository.setPageRequester(this);
 
+        creatorRepository.setPageRequester(this::requestCreatorNextPage);
+
         notifyStatus(television ? "正在加载抖音页面（TV 模式）…" : "正在加载抖音页面…");
 
         createWebView();
@@ -347,6 +359,14 @@ public final class FeedPumpController implements PageRequester {
     @Override
 
     public void requestNextPage() {
+
+        if (creatorMode) {
+
+            requestCreatorNextPage();
+
+            return;
+
+        }
 
         if (webView == null) return;
 
@@ -1410,6 +1430,8 @@ public final class FeedPumpController implements PageRequester {
 
         repository.releasePageRequest();
 
+        creatorRepository.releasePageRequest();
+
     }
 
 
@@ -1666,6 +1688,20 @@ public final class FeedPumpController implements PageRequester {
 
             JSONArray list = extractAwemeList(root);
 
+            if (creatorMode && isCreatorPostUrl(url)) {
+
+                handleCreatorPostData(url, root, list);
+
+                return;
+
+            }
+
+            if (creatorMode) {
+
+                return;
+
+            }
+
             if (list == null || list.length() == 0) {
 
                 if (isFeedApiUrl(url)) {
@@ -1765,6 +1801,154 @@ public final class FeedPumpController implements PageRequester {
         historySyncRequested = false;
 
         Log.d(TAG, "history sync complete, pages=" + historyPagesFetched);
+
+    }
+
+
+
+    /** Switches the hidden pump to a creator profile and captures {@code /aweme/post}. */
+    public void loadCreatorProfile(String secUid) {
+
+        if (webView == null || secUid == null || secUid.isEmpty()) return;
+
+        creatorMode = true;
+
+        activeCreatorSecUid = secUid;
+
+        creatorPaginationState.reset();
+
+        pageFetchInFlight = false;
+
+        notifyStatus("正在打开博主主页…");
+
+        webView.loadUrl(DouyinConstants.creatorProfileUrl(secUid));
+
+    }
+
+
+
+    /** Returns the pump to the global recommend feed after leaving creator browse. */
+    public void restoreFeedPump() {
+
+        if (webView == null) return;
+
+        creatorMode = false;
+
+        activeCreatorSecUid = null;
+
+        creatorPaginationState.reset();
+
+        pageFetchInFlight = false;
+
+        webView.loadUrl(DouyinConstants.pumpStartUrl(loggedIn));
+
+    }
+
+
+
+    public boolean isCreatorMode() {
+
+        return creatorMode;
+
+    }
+
+
+
+    public String getActiveCreatorSecUid() {
+
+        return activeCreatorSecUid;
+
+    }
+
+
+
+    private void requestCreatorNextPage() {
+
+        if (webView == null || !creatorMode || pageFetchInFlight) return;
+
+        pageFetchInFlight = true;
+
+        schedulePageFetchTimeout();
+
+        Log.d(TAG, "nudge creator profile pagination");
+
+        webView.evaluateJavascript(FeedHookScripts.TRIGGER_PAGE_FEED, null);
+
+    }
+
+
+
+    private void handleCreatorPostData(String url, JSONObject root, JSONArray list) {
+
+        if (!isCreatorPostForActiveUser(url)) {
+
+            Log.d(TAG, "ignoring creator post for inactive user from " + url);
+
+            onFeedCaptureComplete();
+
+            return;
+
+        }
+
+        creatorPaginationState.updateFromCapture(url, root);
+
+        creatorRepository.setHasMore(creatorPaginationState.hasMore());
+
+        onFeedCaptureComplete();
+
+        if (list != null && list.length() > 0) {
+
+            Log.d(TAG, "creator post list from " + url + " count=" + list.length());
+
+            notifyStatus("已加载博主作品…");
+
+            creatorRepository.addAwemeList(list);
+
+        } else if (creatorPaginationState.hasMore()) {
+
+            handler.postDelayed(this::requestCreatorNextPage, 1_000);
+
+        }
+
+    }
+
+
+
+    private static boolean isCreatorPostUrl(String url) {
+
+        return url != null && url.contains("/aweme/post");
+
+    }
+
+
+
+    private boolean isCreatorPostForActiveUser(String url) {
+
+        if (!creatorMode || activeCreatorSecUid == null || activeCreatorSecUid.isEmpty()) {
+
+            return false;
+
+        }
+
+        if (url == null) return false;
+
+        try {
+
+            android.net.Uri uri = android.net.Uri.parse(url);
+
+            String secUserId = uri.getQueryParameter("sec_user_id");
+
+            if (secUserId != null && !secUserId.isEmpty()) {
+
+                return activeCreatorSecUid.equals(secUserId);
+
+            }
+
+        } catch (Exception ignored) {
+
+        }
+
+        return true;
 
     }
 

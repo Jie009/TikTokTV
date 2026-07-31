@@ -60,6 +60,10 @@ import mulin.tvdy.auth.CookieHandoffServer;
 import mulin.tvdy.auth.CookieImportHelper;
 import mulin.tvdy.auth.LoginStatusChecker;
 import mulin.tvdy.auth.QrCodeGenerator;
+import androidx.recyclerview.widget.GridLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import mulin.tvdy.data.CreatorVideoRepository;
 import mulin.tvdy.data.FeedRepository;
 import mulin.tvdy.data.FeedVideo;
 import mulin.tvdy.data.WatchedAwemeStore;
@@ -92,6 +96,11 @@ import mulin.tvdy.pump.FeedPumpController;
  */
 public class PlayerActivity extends Activity implements FeedRepository.Listener {
 
+    private enum PlaybackMode {
+        FEED,
+        CREATOR
+    }
+
     private static final String TAG = "PlayerActivity";
     private static final int PRELOAD_AHEAD = 3;
     /** Preload budget while the user is actively watching. */
@@ -119,7 +128,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private static final int HASHTAG_COLOR = Color.parseColor("#7CB2FF");
     private static final Pattern HASHTAG_PATTERN = Pattern.compile("#[^\\s#]+");
 
+    private static final int CREATOR_GRID_COLUMNS = 4;
+
     private final FeedRepository repository = FeedRepository.getInstance();
+    private final CreatorVideoRepository creatorRepository = CreatorVideoRepository.getInstance();
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     /**
@@ -180,8 +192,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private View featureMenu;
     private final List<View> menuItems = new ArrayList<>();
     private int menuSelectedIndex = 0;
-    private ImageView featureMenuLoginAvatar;
+    private View featureMenuAccountHeader;
+    private View featureMenuAccountDivider;
+    private ImageView featureMenuAccountAvatar;
+    private TextView featureMenuAccountName;
+    private View featureMenuLogin;
     private TextView featureMenuLoginText;
+    private View featureMenuLogout;
     private View cookieLoginOverlay;
     private View handoffRow;
     private ImageView handoffQrImage;
@@ -212,10 +229,28 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     /** See {@link #dispatchBackKey} for why this needs to survive across a single press's DOWN and UP. */
     private boolean backConsumedSpecially = false;
 
+    private PlaybackMode playbackMode = PlaybackMode.FEED;
+    private boolean creatorGridVisible = false;
+    private View creatorGridOverlay;
+    private TextView creatorGridTitle;
+    private TextView creatorGridCount;
+    private View creatorGridContent;
+    private View creatorGridLoadingPanel;
+    private LottieAnimationView creatorGridLoading;
+    private boolean creatorGridAwaitingPumpData;
+    private RecyclerView creatorGridList;
+    private CreatorGridAdapter creatorGridAdapter;
+    private FeedVideo feedAnchorVideo;
+    private long feedAnchorPositionMs;
+    /** Blocks ExoPlayer auto-advance right after returning from creator browse. */
+    private boolean suppressFeedAutoAdvance = false;
+
     private final Runnable hideControlsRunnable = this::hideControls;
     private final Runnable startupTimeoutRunnable = this::onStartupTimeout;
     private final Runnable longPressRunnable = this::openFeatureMenu;
     private final Runnable capPreloadWhilePausedRunnable = this::capPreloadWhilePaused;
+    private final Runnable releaseSuppressFeedAutoAdvanceRunnable =
+            () -> suppressFeedAutoAdvance = false;
     private long seekRepeatDeltaMs = 0;
     private final Runnable seekRepeatRunnable = new Runnable() {
         @Override
@@ -264,22 +299,25 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         commentCountText = findViewById(R.id.commentCount);
         collectCountText = findViewById(R.id.collectCount);
         featureMenu = findViewById(R.id.featureMenu);
+        featureMenuAccountHeader = findViewById(R.id.featureMenuAccountHeader);
+        featureMenuAccountDivider = findViewById(R.id.featureMenuAccountDivider);
+        featureMenuAccountAvatar = findViewById(R.id.featureMenuAccountAvatar);
+        featureMenuAccountName = findViewById(R.id.featureMenuAccountName);
+        featureMenuLogin = findViewById(R.id.featureMenuLogin);
+        featureMenuLoginText = findViewById(R.id.featureMenuLoginText);
+        featureMenuLogout = findViewById(R.id.featureMenuLogout);
+
         cookieLoginOverlay = findViewById(R.id.cookieLoginOverlay);
         handoffRow = findViewById(R.id.handoffRow);
         handoffQrImage = findViewById(R.id.handoffQrImage);
         handoffUrlText = findViewById(R.id.handoffUrlText);
         handoffStatusText = findViewById(R.id.handoffStatusText);
 
-        featureMenuLoginAvatar = findViewById(R.id.featureMenuLoginAvatar);
-        featureMenuLoginText = findViewById(R.id.featureMenuLoginText);
-        menuItems.add(findViewById(R.id.featureMenuLogin));
-        menuItems.add(findViewById(R.id.featureMenuCheckLogin));
-        menuItems.add(findViewById(R.id.featureMenuLike));
-        menuItems.add(findViewById(R.id.featureMenuFollow));
-        menuItems.add(findViewById(R.id.featureMenuComments));
-
         makeCircular(avatarImage);
-        makeCircular(featureMenuLoginAvatar);
+        makeCircular(featureMenuAccountAvatar);
+        rebuildMenuItems();
+
+        setupCreatorGrid();
 
         WatchedAwemeStore.getInstance().init(this);
 
@@ -312,6 +350,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         });
         if (hasSavedSession()) {
             pump.setLoggedIn(true);
+            syncLoginUiWithSession();
         }
         pump.start((ViewGroup) findViewById(R.id.playerRoot));
 
@@ -347,7 +386,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                     hideSplashIfNeeded();
                 }
                 if (playbackState == Player.STATE_ENDED) {
-                    playNext();
+                    if (suppressFeedAutoAdvance && playbackMode == PlaybackMode.FEED) {
+                        player.seekTo(playlistIndex, 0);
+                        player.pause();
+                        updatePlaybackChrome();
+                    } else {
+                        playNext();
+                    }
                 } else {
                     updatePlaybackChrome();
                     updateProgressUi();
@@ -396,6 +441,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         playerView.setPlayer(player);
 
         repository.addListener(this);
+        creatorRepository.addListener(this::onCreatorVideosChanged);
         startInitialPlayback();
     }
 
@@ -542,9 +588,22 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
             @Override
             public void onCheckFailed() {
-                // Timed out - leave menu at default; user can re-check manually.
+                if (hasSavedSession()) {
+                    syncLoginUiWithSession();
+                }
             }
         });
+    }
+
+    /** Keeps the feature menu in sync with saved cookies (no server round-trip). */
+    private void syncLoginUiWithSession() {
+        if (hasSavedSession()) {
+            if (!loggedIn) {
+                setLoginState(true, loggedInNickname, loggedInAvatarUrl);
+            }
+        } else if (loggedIn) {
+            setLoginState(false, null, null);
+        }
     }
 
     private void maybeRunDeferredLoginCheck() {
@@ -692,6 +751,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             return true;
         }
 
+        if (creatorGridVisible) {
+            return super.dispatchKeyEvent(event);
+        }
+
         // OK/center is overloaded (short press = start/pause, long press =
         // feature menu), so it needs its own down/up tracking instead of the
         // single ACTION_DOWN switch below.
@@ -767,6 +830,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 backConsumedSpecially = true;
             } else if (featureMenuVisible) {
                 closeFeatureMenu();
+                backConsumedSpecially = true;
+            } else if (creatorGridVisible) {
+                closeCreatorGrid();
+                backConsumedSpecially = true;
+            } else if (playbackMode == PlaybackMode.CREATOR) {
+                exitCreatorPlaybackToGrid();
                 backConsumedSpecially = true;
             } else if (controlsVisible) {
                 hideControls();
@@ -938,6 +1007,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private void openFeatureMenu() {
         centerLongPressFired = true;
+        syncLoginUiWithSession();
         featureMenuVisible = true;
         menuSelectedIndex = 0;
         updateMenuHighlight();
@@ -967,61 +1037,55 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         }
     }
 
-    /** Only "登录账号"(/logout)/"检测登录状态" are wired up so far; the rest are still placeholders. */
+    /** Login/logout and creator browse are wired; the rest are placeholders. */
     private void activateSelectedMenuItem() {
+        if (menuItems.isEmpty()) return;
         int index = menuSelectedIndex;
+        View item = menuItems.get(index);
         closeFeatureMenu();
-        switch (index) {
-            case 0:
-                if (loggedIn) {
-                    logout();
-                } else {
-                    startCookieLogin();
-                }
-                break;
-            case 1:
-                checkLoginStatusFromMenu();
-                break;
-            default:
-                Toast.makeText(this, "功能开发中", Toast.LENGTH_SHORT).show();
-                break;
+        int id = item.getId();
+        if (id == R.id.featureMenuLogin) {
+            startCookieLogin();
+        } else if (id == R.id.featureMenuCreator) {
+            openCreatorGrid();
+        } else if (id == R.id.featureMenuLogout) {
+            logout();
+        } else {
+            Toast.makeText(this, "功能开发中", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void rebuildMenuItems() {
+        menuItems.clear();
+        if (loggedIn) {
+            featureMenuAccountHeader.setVisibility(View.VISIBLE);
+            featureMenuAccountDivider.setVisibility(View.VISIBLE);
+            featureMenuLogin.setVisibility(View.GONE);
+            featureMenuLogout.setVisibility(View.VISIBLE);
+            menuItems.add(findViewById(R.id.featureMenuCreator));
+            menuItems.add(findViewById(R.id.featureMenuLike));
+            menuItems.add(findViewById(R.id.featureMenuFollow));
+            menuItems.add(findViewById(R.id.featureMenuComments));
+            menuItems.add(featureMenuLogout);
+        } else {
+            featureMenuAccountHeader.setVisibility(View.GONE);
+            featureMenuAccountDivider.setVisibility(View.GONE);
+            featureMenuLogin.setVisibility(View.VISIBLE);
+            featureMenuLogout.setVisibility(View.GONE);
+            menuItems.add(featureMenuLogin);
+            menuItems.add(findViewById(R.id.featureMenuCreator));
+            menuItems.add(findViewById(R.id.featureMenuLike));
+            menuItems.add(findViewById(R.id.featureMenuFollow));
+            menuItems.add(findViewById(R.id.featureMenuComments));
+        }
+        if (menuSelectedIndex >= menuItems.size()) {
+            menuSelectedIndex = 0;
         }
     }
 
     /**
-     * Ad-hoc, user-triggered re-run of the same server-side check
-     * {@link #applyCookieAndFinish} does right after a fresh login - lets
-     * the user confirm days later whether douyin's servers still honor the
-     * session currently held, without needing to go through the whole
-     * scan-and-paste flow again just to find out. Reported via Toasts
-     * rather than {@link #handoffStatusText} since the cookie overlay isn't
-     * necessarily open when this runs.
-     */
-    private void checkLoginStatusFromMenu() {
-        Toast.makeText(this, "正在向抖音服务器验证登录状态…", Toast.LENGTH_SHORT).show();
-        new LoginStatusChecker().check(this, (ViewGroup) findViewById(R.id.playerRoot), new LoginStatusChecker.Callback() {
-            @Override
-            public void onResult(boolean loggedIn, String nickname, String avatarUrl) {
-                setLoginState(loggedIn, nickname, avatarUrl);
-                Toast.makeText(PlayerActivity.this,
-                        loggedIn ? "已登录：" + nickname : "未登录（Cookie 已失效或从未成功登录）",
-                        Toast.LENGTH_LONG).show();
-            }
-
-            @Override
-            public void onCheckFailed() {
-                Toast.makeText(PlayerActivity.this, "验证超时，请检查网络后重试", Toast.LENGTH_LONG).show();
-            }
-        });
-    }
-
-    /**
-     * Reflects a {@link LoginStatusChecker} result in the feature menu's
-     * login row: its avatar/nickname while {@link #loggedIn}, or back to
-     * the plain "登录账号" prompt once it isn't. This is the single place
-     * that row's contents come from, fed by three different triggers - the
-     * initial login flow, a manual "检测登录状态", and the silent startup
-     * check - so all three stay visually consistent with each other.
+     * Reflects a {@link LoginStatusChecker} result in the feature menu header
+     * while {@link #loggedIn}, or the plain "登录账号" row once it isn't.
      */
     private void setLoginState(boolean loggedIn, String nickname, String avatarUrl) {
         this.loggedIn = loggedIn;
@@ -1032,25 +1096,22 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         }
         WatchedAwemeStore.getInstance().bindSession();
         if (loggedIn) {
-            featureMenuLoginText.setText(
-                    loggedInNickname != null && !loggedInNickname.isEmpty() ? loggedInNickname : "已登录");
-            featureMenuLoginAvatar.setVisibility(View.VISIBLE);
-            SimpleImageLoader.load(loggedInAvatarUrl, featureMenuLoginAvatar);
+            String displayName = loggedInNickname != null && !loggedInNickname.isEmpty()
+                    ? loggedInNickname : "已登录";
+            featureMenuAccountName.setText(displayName);
+            if (loggedInAvatarUrl != null && !loggedInAvatarUrl.isEmpty()) {
+                SimpleImageLoader.load(loggedInAvatarUrl, featureMenuAccountAvatar);
+            }
         } else {
             featureMenuLoginText.setText("登录账号");
-            featureMenuLoginAvatar.setVisibility(View.GONE);
-            featureMenuLoginAvatar.setImageDrawable(null);
         }
+        rebuildMenuItems();
     }
 
     /**
-     * Selecting the login row while already {@link #loggedIn} logs out
-     * instead of reopening the login flow: wipes the Cookie ({@link
-     * CookieImportHelper#clear}), reverts the row back to "登录账号", and
-     * reloads the feed so the pump WebView's next fetch goes out as an
-     * anonymous session instead of continuing to ride the now-cleared one.
-     * {@link #resetPlaybackAndFeed()} clears any videos buffered under the
-     * old session so they are not played after logout.
+     * Wipes the Cookie ({@link CookieImportHelper#clear}), reloads the feed
+     * so the pump WebView's next fetch goes out as an anonymous session, and
+     * clears any videos buffered under the old session.
      */
     private void logout() {
         CookieImportHelper.clear();
@@ -1169,17 +1230,26 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private void playNext() {
         if (playlistIndex + 1 >= playlist.size()) {
-            // Preload window exhausted (rare - refillPlaylist() normally keeps
-            // PRELOAD_AHEAD items queued well before this point is reached).
-            FeedVideo next = repository.pollNext();
-            if (next == null) {
-                waitingForBuffer = true;
-                pendingAdvance = 1;
-                updatePlaybackChrome();
-                return;
+            if (playbackMode == PlaybackMode.CREATOR) {
+                syncCreatorPlaylistTail();
+                if (playlistIndex + 1 >= playlist.size()) {
+                    waitingForBuffer = true;
+                    pendingAdvance = 1;
+                    creatorRepository.kickstartPaging();
+                    updatePlaybackChrome();
+                    return;
+                }
+            } else {
+                FeedVideo next = pollNextFeedVideo();
+                if (next == null) {
+                    waitingForBuffer = true;
+                    pendingAdvance = 1;
+                    updatePlaybackChrome();
+                    return;
+                }
+                playlist.add(next);
+                player.addMediaItem(mediaItemFor(next));
             }
-            playlist.add(next);
-            player.addMediaItem(mediaItemFor(next));
         }
         waitingForBuffer = false;
         pendingAdvance = 0;
@@ -1247,6 +1317,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      * finished video's resume position is cleared directly instead.
      */
     private void handleAutoAdvance() {
+        if (suppressFeedAutoAdvance && playbackMode == PlaybackMode.FEED) {
+            player.seekTo(playlistIndex, feedAnchorPositionMs);
+            player.pause();
+            updatePlaybackChrome();
+            return;
+        }
         int newIndex = player.getCurrentMediaItemIndex();
         if (newIndex == playlistIndex || newIndex < 0 || newIndex >= playlist.size()) return;
         if (current != null) {
@@ -1275,19 +1351,22 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      *                  from top).
      */
     private void advance(int direction) {
+        if (playbackMode == PlaybackMode.FEED) {
+            suppressFeedAutoAdvance = false;
+            handler.removeCallbacks(releaseSuppressFeedAutoAdvanceRunnable);
+        }
         Runnable step = () -> {
             rememberCurrentPosition();
             playlistIndex += direction;
+            if (playlistIndex < 0 || playlistIndex >= playlist.size()) {
+                playlistIndex -= direction;
+                return;
+            }
             if (direction > 0) {
-                player.seekToNextMediaItem();
                 refillPlaylist();
-            } else {
-                player.seekToPreviousMediaItem();
             }
             Long resumeMs = resumePositions.get(playlist.get(playlistIndex).awemeId);
-            if (resumeMs != null) {
-                player.seekTo(resumeMs);
-            }
+            player.seekTo(playlistIndex, resumeMs != null ? resumeMs : 0L);
             applyCurrentUi();
             player.play();
         };
@@ -1320,12 +1399,21 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
      * doesn't grow unbounded over a long session.
      */
     private void refillPlaylist() {
+        if (playbackMode == PlaybackMode.CREATOR) {
+            syncCreatorPlaylistTail();
+            trimPlaylistHead();
+            return;
+        }
         while (playlist.size() - (playlistIndex + 1) < PRELOAD_AHEAD) {
-            FeedVideo next = repository.pollNext();
+            FeedVideo next = pollNextFeedVideo();
             if (next == null) break;
             playlist.add(next);
             player.addMediaItem(mediaItemFor(next));
         }
+        trimPlaylistHead();
+    }
+
+    private void trimPlaylistHead() {
         while (playlistIndex > HISTORY_KEEP) {
             FeedVideo dropped = playlist.remove(0);
             resumePositions.remove(dropped.awemeId);
@@ -1373,6 +1461,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private void applyCurrentUi() {
+        ensureFeedPumpForFeedPlayback();
         FeedVideo video = playlist.get(playlistIndex);
         current = video;
         coverImage.setAlpha(1f);
@@ -1497,6 +1586,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     @Override
     public void onBufferChanged(int size) {
+        if (playbackMode == PlaybackMode.CREATOR) {
+            onCreatorBufferChanged();
+            return;
+        }
         if (size <= 0 || !waitingForBuffer) return;
 
         cancelStartupTimeout();
@@ -1511,8 +1604,17 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         waitingForBuffer = false;
         if (playlistIndex < 0) {
             startInitialPlayback();
+        } else if (pendingAdvance != 0) {
+            int advanceBy = pendingAdvance;
+            pendingAdvance = 0;
+            if (advanceBy > 0) {
+                playNext();
+            } else {
+                playPrevious();
+            }
         } else {
-            playNext();
+            refillPlaylist();
+            updatePlaybackChrome();
         }
     }
 
@@ -1533,5 +1635,292 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             refillPlaylist();
         }
         adjustPreloadForPause();
+    }
+
+    private void setupCreatorGrid() {
+        creatorGridOverlay = findViewById(R.id.creatorGridOverlay);
+        creatorGridContent = findViewById(R.id.creatorGridContent);
+        creatorGridTitle = findViewById(R.id.creatorGridTitle);
+        creatorGridCount = findViewById(R.id.creatorGridCount);
+        creatorGridLoadingPanel = findViewById(R.id.creatorGridLoadingPanel);
+        creatorGridLoading = findViewById(R.id.creatorGridLoading);
+        creatorGridList = findViewById(R.id.creatorGridList);
+        ImageView creatorGridAvatar = findViewById(R.id.creatorGridAvatar);
+        makeCircular(creatorGridAvatar);
+
+        creatorGridAdapter = new CreatorGridAdapter();
+        creatorGridAdapter.setOnVideoSelectedListener(this::startCreatorPlayback);
+        creatorGridList.setLayoutManager(new GridLayoutManager(this, CREATOR_GRID_COLUMNS));
+        creatorGridList.setAdapter(creatorGridAdapter);
+        creatorGridList.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
+                if (dy <= 0 || !creatorGridVisible) return;
+                GridLayoutManager layoutManager = (GridLayoutManager) recyclerView.getLayoutManager();
+                if (layoutManager == null) return;
+                int lastVisible = layoutManager.findLastVisibleItemPosition();
+                if (lastVisible >= creatorGridAdapter.getItemCount() - CREATOR_GRID_COLUMNS) {
+                    creatorRepository.kickstartPaging();
+                }
+            }
+        });
+    }
+
+    private void openCreatorGrid() {
+        if (creatorGridVisible || current == null) return;
+        String secUid = current.authorSecUid;
+        if (secUid == null || secUid.isEmpty()) {
+            Toast.makeText(this, "无法打开该博主主页", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (playbackMode == PlaybackMode.CREATOR) {
+            playbackMode = PlaybackMode.FEED;
+        }
+
+        creatorGridAdapter.setVideos(Collections.emptyList());
+        creatorGridAwaitingPumpData = true;
+        setCreatorGridLoading(true);
+
+        saveFeedAnchor();
+        if (player != null) {
+            player.pause();
+        }
+
+        creatorRepository.setCreator(secUid, current.authorName, current.authorAvatarUrl);
+
+        String activeSecUid = pump.getActiveCreatorSecUid();
+        if (pump.isCreatorMode() && secUid.equals(activeSecUid)) {
+            creatorRepository.kickstartPaging();
+        } else {
+            pump.loadCreatorProfile(secUid);
+            creatorRepository.kickstartPaging();
+        }
+
+        creatorGridVisible = true;
+        creatorGridOverlay.setVisibility(View.VISIBLE);
+        updateCreatorGridUi();
+        creatorGridList.post(() -> {
+            if (creatorGridList.getChildCount() > 0) {
+                creatorGridList.getChildAt(0).requestFocus();
+            } else {
+                creatorGridList.requestFocus();
+            }
+        });
+    }
+
+    private void ensureFeedPumpForFeedPlayback() {
+        if (playbackMode != PlaybackMode.FEED || creatorGridVisible) return;
+        if (pump.isCreatorMode()) {
+            creatorRepository.reset();
+            pump.restoreFeedPump();
+        } else if (creatorRepository.getCreatorSecUid() != null) {
+            creatorRepository.reset();
+        }
+    }
+
+    private void closeCreatorGrid() {
+        creatorGridVisible = false;
+        creatorGridAwaitingPumpData = false;
+        creatorGridOverlay.setVisibility(View.GONE);
+        creatorGridAdapter.setVideos(Collections.emptyList());
+        creatorRepository.reset();
+        pump.restoreFeedPump();
+        restoreFeedToAnchor();
+    }
+
+    /** Remembers the feed video the user was on when opening a creator profile. */
+    private void saveFeedAnchor() {
+        feedAnchorVideo = current;
+        feedAnchorPositionMs = player != null ? player.getCurrentPosition() : 0;
+    }
+
+    /**
+     * Returns to {@link #feedAnchorVideo} as playlist index {@code 0}, paused
+     * at the saved position. Next/preload items are added only after the user
+     * navigates with up/down.
+     */
+    private void restoreFeedToAnchor() {
+        playbackMode = PlaybackMode.FEED;
+        waitingForBuffer = false;
+        pendingAdvance = 0;
+
+        if (feedAnchorVideo == null || player == null) {
+            updatePlaybackChrome();
+            return;
+        }
+
+        rebuildFeedPlaylistFromAnchor();
+    }
+
+    private void rebuildFeedPlaylistFromAnchor() {
+        suppressFeedAutoAdvance = true;
+        handler.removeCallbacks(releaseSuppressFeedAutoAdvanceRunnable);
+        handler.postDelayed(releaseSuppressFeedAutoAdvanceRunnable, 8_000);
+
+        playlist.clear();
+        player.clearMediaItems();
+        playlist.add(feedAnchorVideo);
+        playlistIndex = 0;
+
+        player.addMediaItem(mediaItemFor(feedAnchorVideo));
+
+        current = feedAnchorVideo;
+        player.prepare();
+        player.seekTo(0, feedAnchorPositionMs);
+        applyCurrentUi();
+        player.setPlayWhenReady(false);
+        player.pause();
+        updatePlaybackChrome();
+    }
+
+    private boolean isDuplicateForFeedPlaylist(FeedVideo video) {
+        if (video == null) return true;
+        if (playlistContains(video.awemeId)) return true;
+        return feedAnchorVideo != null && feedAnchorVideo.awemeId.equals(video.awemeId);
+    }
+
+    /** Drains {@link FeedRepository} until a non-duplicate feed item appears. */
+    private FeedVideo pollNextFeedVideo() {
+        for (int attempt = 0; attempt < 32; attempt++) {
+            FeedVideo next = repository.pollNext();
+            if (next == null) return null;
+            if (!isDuplicateForFeedPlaylist(next)) return next;
+        }
+        return null;
+    }
+
+    private void exitCreatorPlaybackToGrid() {
+        if (player != null) {
+            player.pause();
+        }
+        creatorGridVisible = true;
+        creatorGridOverlay.setVisibility(View.VISIBLE);
+        updateCreatorGridUi();
+        creatorGridList.post(() -> {
+            int focusIndex = current != null
+                    ? creatorRepository.indexOf(current.awemeId) : 0;
+            if (focusIndex < 0) focusIndex = 0;
+            final int focusPos = focusIndex;
+            creatorGridList.scrollToPosition(focusPos);
+            creatorGridList.post(() -> {
+                View child = creatorGridList.getLayoutManager() != null
+                        ? creatorGridList.getLayoutManager().findViewByPosition(focusPos)
+                        : null;
+                if (child != null) {
+                    child.requestFocus();
+                } else if (creatorGridList.getChildCount() > 0) {
+                    creatorGridList.getChildAt(0).requestFocus();
+                }
+            });
+        });
+    }
+
+    private void startCreatorPlayback(int index) {
+        List<FeedVideo> videos = creatorRepository.snapshot();
+        if (index < 0 || index >= videos.size()) return;
+
+        creatorGridVisible = false;
+        creatorGridOverlay.setVisibility(View.GONE);
+        playbackMode = PlaybackMode.CREATOR;
+        waitingForBuffer = false;
+        pendingAdvance = 0;
+
+        playlist.clear();
+        player.clearMediaItems();
+        playlist.addAll(videos);
+        playlistIndex = index;
+
+        for (FeedVideo video : playlist) {
+            player.addMediaItem(mediaItemFor(video));
+        }
+
+        player.seekTo(playlistIndex, 0);
+        applyCurrentUi();
+        player.prepare();
+        player.setPlayWhenReady(true);
+        player.play();
+        adjustPreloadForPlay();
+        updatePlaybackChrome();
+        refillPlaylist();
+    }
+
+    private void updateCreatorGridUi() {
+        String nickname = creatorRepository.getCreatorNickname();
+        creatorGridTitle.setText(nickname != null && !nickname.isEmpty()
+                ? "@" + nickname : "博主作品");
+        ImageView avatar = findViewById(R.id.creatorGridAvatar);
+        SimpleImageLoader.load(creatorRepository.getCreatorAvatarUrl(), avatar);
+
+        List<FeedVideo> videos = creatorRepository.snapshot();
+        creatorGridAdapter.setVideos(videos);
+        creatorGridCount.setText(videos.size() + " 个视频");
+        setCreatorGridLoading(creatorGridAwaitingPumpData);
+    }
+
+    private void setCreatorGridLoading(boolean loading) {
+        creatorGridLoadingPanel.setVisibility(loading ? View.VISIBLE : View.GONE);
+        if (creatorGridContent != null) {
+            creatorGridContent.setVisibility(loading ? View.GONE : View.VISIBLE);
+        }
+        creatorGridList.setVisibility(loading ? View.INVISIBLE : View.VISIBLE);
+        if (loading) {
+            creatorGridLoadingPanel.bringToFront();
+            creatorGridLoading.setVisibility(View.VISIBLE);
+            if (!creatorGridLoading.isAnimating()) {
+                creatorGridLoading.playAnimation();
+            }
+        } else {
+            creatorGridLoading.pauseAnimation();
+        }
+    }
+
+    private void onCreatorVideosChanged(int size) {
+        if (creatorGridVisible && creatorGridAwaitingPumpData && size > 0) {
+            creatorGridAwaitingPumpData = false;
+        }
+        if (creatorGridVisible) {
+            updateCreatorGridUi();
+            if (size > 0 && creatorGridList.getFocusedChild() == null) {
+                creatorGridList.post(() -> {
+                    if (creatorGridList.getChildCount() > 0) {
+                        creatorGridList.getChildAt(0).requestFocus();
+                    }
+                });
+            }
+        }
+        if (playbackMode == PlaybackMode.CREATOR && waitingForBuffer) {
+            onCreatorBufferChanged();
+        }
+    }
+
+    private void onCreatorBufferChanged() {
+        if (!waitingForBuffer) return;
+        syncCreatorPlaylistTail();
+        if (playlistIndex + 1 < playlist.size()) {
+            waitingForBuffer = false;
+            pendingAdvance = 0;
+            playNext();
+        }
+    }
+
+    private void syncCreatorPlaylistTail() {
+        for (FeedVideo video : creatorRepository.snapshot()) {
+            if (!playlistContains(video.awemeId)) {
+                playlist.add(video);
+                player.addMediaItem(mediaItemFor(video));
+            }
+        }
+        if (playlist.size() - (playlistIndex + 1) < PRELOAD_AHEAD && creatorRepository.hasMore()) {
+            creatorRepository.kickstartPaging();
+        }
+    }
+
+    private boolean playlistContains(String awemeId) {
+        if (awemeId == null) return false;
+        for (FeedVideo video : playlist) {
+            if (awemeId.equals(video.awemeId)) return true;
+        }
+        return false;
     }
 }

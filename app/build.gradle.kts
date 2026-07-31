@@ -45,6 +45,7 @@ dependencies {
     // Renders the startup loading.json animation (see PlayerActivity's
     // splash overlay); 6.7.1 still supports minSdk 21.
     implementation("com.airbnb.android:lottie:6.7.1")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
