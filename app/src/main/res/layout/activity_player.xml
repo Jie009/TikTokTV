@@ -9,41 +9,32 @@
     <FrameLayout
         android:id="@+id/contentContainer"
         android:layout_width="match_parent"
-        android:layout_height="match_parent">
+        android:layout_height="match_parent"
+        android:clipChildren="false"
+        android:clipToPadding="false">
 
-        <!-- Fills the pillarbox bars either side of a vertical video (this
-             layout is forced landscape for TV, but douyin content is almost
-             always 9:16) with a blurred, zoomed copy of that video's own
-             cover art instead of plain black. Sits behind everything else
-             and, unlike coverImage below, is never faded out - the sharp
-             video only ever covers its own correctly-fitted rect (see
-             playerView's app:resize_mode="fit"), leaving this visible in the
-             leftover space for as long as this video is on screen. -->
-        <ImageView
-            android:id="@+id/backdropImage"
+        <!-- Dual-page slide host: outgoing and incoming videos move together
+             (see PlayerActivity#advance) instead of sliding off to black. -->
+        <FrameLayout
+            android:id="@+id/slideHost"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="#000000"
-            android:scaleType="centerCrop"
-            android:alpha="0.55"
-            android:contentDescription="@null" />
+            android:clipChildren="false"
+            android:clipToPadding="false">
 
-        <ImageView
-            android:id="@+id/coverImage"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#000000"
-            android:scaleType="centerCrop"
-            android:contentDescription="@null" />
+            <include
+                android:id="@+id/slidePageB"
+                layout="@layout/video_slide_page"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
 
-        <androidx.media3.ui.PlayerView
-            android:id="@+id/playerView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="@android:color/transparent"
-            app:surface_type="texture_view"
-            app:use_controller="false"
-            app:resize_mode="fit" />
+            <include
+                android:id="@+id/slidePageA"
+                layout="@layout/video_slide_page"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
+
+        </FrameLayout>
 
         <!-- Auto-hiding chrome: title + author at top, time/progress/stats at
              bottom. Both panels are shown/hidden together (see

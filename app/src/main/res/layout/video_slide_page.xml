@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ImageView
+        android:id="@+id/backdropImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:alpha="0.55"
+        android:background="#000000"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop" />
+
+    <ImageView
+        android:id="@+id/coverImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop" />
+
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/playerView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent"
+        app:resize_mode="fit"
+        app:surface_type="texture_view"
+        app:use_controller="false" />
+
+    <!-- Full-page freeze frame (video + blurred pillarbox backdrop). -->
+    <ImageView
+        android:id="@+id/snapshotImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop"
+        android:visibility="gone" />
+
+</FrameLayout>

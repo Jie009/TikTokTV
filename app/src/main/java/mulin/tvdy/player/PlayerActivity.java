@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
+import android.graphics.Bitmap;
 import android.graphics.Outline;
 import android.os.Bundle;
 import android.os.Handler;
@@ -34,6 +35,7 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.ExoPlayer.PreloadConfiguration;
@@ -103,19 +105,30 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private static final String TAG = "PlayerActivity";
     private static final int PRELOAD_AHEAD = 3;
-    /** Preload budget while the user is actively watching. */
+    /** Preload budget while the user is actively watching (short head-start only). */
     private static final long PRELOAD_PLAYING_US = 10_000_000L;
-    /** Smaller head-start for the next item while paused (then preload idles). */
-    private static final long PRELOAD_PAUSED_US = 5_000_000L;
-    /** After pausing, let the paused preload budget fill then stop fetching ahead. */
-    private static final long PRELOAD_PAUSE_SETTLE_MS = 3_000;
+    /** While paused, buffer the full upcoming playlist item(s). */
+    private static final long PRELOAD_PAUSED_US = 600_000_000L;
+    /** Min media duration ExoPlayer tries to keep buffered while playing. */
+    private static final int MIN_BUFFER_MS = 30_000;
+    /** Max media duration ExoPlayer will buffer ahead of the playhead. */
+    private static final int MAX_BUFFER_MS = 120_000;
+    /** Min buffered media required before initial start / user seek resume. */
+    private static final int BUFFER_FOR_PLAYBACK_MS = 5_000;
+    /**
+     * Min buffered media required to resume after a network stall. Larger values
+     * avoid the "buffer a little → play → stall again" loop on slow links.
+     */
+    private static final int BUFFER_AFTER_REBUFFER_MS = 10_000;
     private static final int HISTORY_KEEP = 3;
     private static final long SEEK_STEP_MS = 5_000;
     /** Delay before repeated seeks begin while a direction key is held. */
     private static final long SEEK_REPEAT_INITIAL_MS = 400;
     /** Interval between repeated seeks while the key stays down. */
     private static final long SEEK_REPEAT_INTERVAL_MS = 300;
-    private static final int SLIDE_DURATION_MS = 220;
+    private static final int SLIDE_DURATION_MS = 280;
+    /** Max wait for the incoming video's first frame before starting the slide. */
+    private static final long SLIDE_FRAME_WAIT_MS = 500;
     private static final long CONTROLS_AUTO_HIDE_MS = 3_000;
     private static final long CENTER_LONG_PRESS_MS = 500;
     private static final long PROGRESS_UPDATE_INTERVAL_MS = 500;
@@ -172,7 +185,15 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private int startupRetryCount = 0;
     private long startupTimeoutMs;
     private boolean pendingStartupLoginCheck = false;
-    private FrameLayout contentContainer;
+    private FrameLayout slideHost;
+    private VideoSlidePage pageOut;
+    private VideoSlidePage pageIn;
+    /** The page that currently owns the ExoPlayer surface. */
+    private VideoSlidePage playerPage;
+    private boolean slideAnimating = false;
+    /** First frame arrived while the slide animation was still running. */
+    private boolean pendingCoverDismiss = false;
+    /** Convenience alias – always {@link #pageOut}'s views while idle. */
     private PlayerView playerView;
     private ImageView backdropImage;
     private ImageView coverImage;
@@ -248,7 +269,6 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private final Runnable hideControlsRunnable = this::hideControls;
     private final Runnable startupTimeoutRunnable = this::onStartupTimeout;
     private final Runnable longPressRunnable = this::openFeatureMenu;
-    private final Runnable capPreloadWhilePausedRunnable = this::capPreloadWhilePaused;
     private final Runnable releaseSuppressFeedAutoAdvanceRunnable =
             () -> suppressFeedAutoAdvance = false;
     private long seekRepeatDeltaMs = 0;
@@ -281,10 +301,14 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         splashOverlay = findViewById(R.id.splashOverlay);
         splashAnimation = findViewById(R.id.splashAnimation);
         splashStatusText = findViewById(R.id.splashStatusText);
-        contentContainer = findViewById(R.id.contentContainer);
-        backdropImage = findViewById(R.id.backdropImage);
-        coverImage = findViewById(R.id.coverImage);
-        playerView = findViewById(R.id.playerView);
+        slideHost = findViewById(R.id.slideHost);
+        pageOut = new VideoSlidePage(findViewById(R.id.slidePageA));
+        pageIn = new VideoSlidePage(findViewById(R.id.slidePageB));
+        playerPage = pageOut;
+        playerView = pageOut.playerView;
+        coverImage = pageOut.coverImage;
+        backdropImage = pageOut.backdropImage;
+        initSlidePages();
         loadingSpinner = findViewById(R.id.loadingSpinner);
         pauseIcon = findViewById(R.id.pauseIcon);
         topPanel = findViewById(R.id.topPanel);
@@ -359,6 +383,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
         player = new ExoPlayer.Builder(this, buildRenderersFactory())
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(httpDataSourceFactory))
+                .setLoadControl(buildLoadControl())
                 .setAudioAttributes(
                         new AudioAttributes.Builder()
                                 .setUsage(C.USAGE_MEDIA)
@@ -378,6 +403,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 .build();
         player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_PLAYING_US));
         player.setRepeatMode(Player.REPEAT_MODE_OFF);
+        player.setPauseAtEndOfMediaItems(true);
 
         player.addListener(new Player.Listener() {
             @Override
@@ -401,17 +427,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
             @Override
             public void onMediaItemTransition(MediaItem mediaItem, int reason) {
-                // Fires the instant one item finishes and ExoPlayer auto-
-                // continues to the next already-queued item on its own -
-                // see handleAutoAdvance() for why this (not STATE_ENDED) is
-                // the real "a video just finished naturally" signal.
-                // MEDIA_ITEM_TRANSITION_REASON_SEEK is deliberately ignored
-                // here: that's *our own* seekToNextMediaItem()/
-                // seekToPreviousMediaItem() calls in advance(), which
-                // already do their own bookkeeping.
-                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                    handleAutoAdvance();
-                }
+                // Natural end-of-video is handled via STATE_ENDED +
+                // playNext() so we can run the dual-page slide animation.
+                // Seek-driven transitions are handled in advance().
             }
 
             @Override
@@ -424,7 +442,11 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
             @Override
             public void onRenderedFirstFrame() {
-                coverImage.animate().alpha(0f).setDuration(180).start();
+                if (slideAnimating) {
+                    pendingCoverDismiss = true;
+                    return;
+                }
+                dismissCoverOnPlayerPage();
                 hideSplashIfNeeded();
                 if (pump != null) pump.notifyPlaybackStarted();
             }
@@ -443,6 +465,38 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         repository.addListener(this);
         creatorRepository.addListener(this::onCreatorVideosChanged);
         startInitialPlayback();
+    }
+
+    /** Keeps the idle incoming page off-screen and below the active page in z-order. */
+    private void initSlidePages() {
+        pageIn.detachPlayer();
+        pageOut.root.bringToFront();
+        Runnable parkIncoming = () -> {
+            int height = slideHost.getHeight();
+            if (height > 0) {
+                pageIn.resetForReuse(height);
+            }
+        };
+        if (slideHost.getHeight() > 0) {
+            parkIncoming.run();
+        } else {
+            slideHost.post(parkIncoming);
+        }
+    }
+
+    private void showActivePage() {
+        pageOut.root.bringToFront();
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private DefaultLoadControl buildLoadControl() {
+        return new DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                        MIN_BUFFER_MS,
+                        MAX_BUFFER_MS,
+                        BUFFER_FOR_PLAYBACK_MS,
+                        BUFFER_AFTER_REBUFFER_MS)
+                .build();
     }
 
     /**
@@ -660,6 +714,18 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             player.stop();
             player.clearMediaItems();
         }
+        slideAnimating = false;
+        pageOut.clearSnapshot();
+        pageIn.clearSnapshot();
+        pageOut.attachPlayer(player);
+        pageIn.detachPlayer();
+        pageOut.root.setTranslationY(0);
+        playerPage = pageOut;
+        playerView = pageOut.playerView;
+        coverImage = pageOut.coverImage;
+        backdropImage = pageOut.backdropImage;
+        showActivePage();
+        slideHost.post(() -> pageIn.resetForReuse(slideHost.getHeight()));
         coverImage.setAlpha(1f);
         scheduleStartupTimeout();
         pump.setLoggedIn(loggedIn);
@@ -943,28 +1009,18 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         updatePlaybackChrome();
     }
 
-    /** Full preload budget while the user is watching. */
+    /** Short head-start for the next item while actively playing. */
     private void adjustPreloadForPlay() {
-        handler.removeCallbacks(capPreloadWhilePausedRunnable);
         if (player != null) {
             player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_PLAYING_US));
         }
     }
 
-    /**
-     * While paused, buffer a slice of the next item, then stop ahead-fetching
-     * until the user resumes (see {@link #capPreloadWhilePaused}).
-     */
+    /** Full preload of upcoming item(s) while paused and not consuming bandwidth. */
     private void adjustPreloadForPause() {
         if (player == null) return;
+        refillPlaylist();
         player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_PAUSED_US));
-        handler.removeCallbacks(capPreloadWhilePausedRunnable);
-        handler.postDelayed(capPreloadWhilePausedRunnable, PRELOAD_PAUSE_SETTLE_MS);
-    }
-
-    private void capPreloadWhilePaused() {
-        if (player == null || player.getPlayWhenReady()) return;
-        player.setPreloadConfiguration(PreloadConfiguration.DEFAULT);
     }
 
     private void seekBy(long deltaMs) {
@@ -1249,6 +1305,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 }
                 playlist.add(next);
                 player.addMediaItem(mediaItemFor(next));
+                SimpleImageLoader.preload(next.coverUrl);
             }
         }
         waitingForBuffer = false;
@@ -1302,93 +1359,152 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     /**
-     * Keeps {@link #playlistIndex}/{@link #current}/the on-screen info in
-     * sync when ExoPlayer moves to the next item entirely on its own
-     * (see {@code onMediaItemTransition} above) - the video content has
-     * already switched by the time this runs, so unlike {@link #advance}
-     * this deliberately does no slide animation and no seek (the player is
-     * already there); it just catches the rest of this app's bookkeeping
-     * up to what ExoPlayer already did, using {@code getCurrentMediaItemIndex()}
-     * as ground truth rather than assuming it only ever moved by one.
-     * <p>
-     * {@link #rememberCurrentPosition} can't be reused here: by this point
-     * {@code player.getDuration()}/{@code getCurrentPosition()} already
-     * refer to the *new* item, not the one that just finished, so the just-
-     * finished video's resume position is cleared directly instead.
-     */
-    private void handleAutoAdvance() {
-        if (suppressFeedAutoAdvance && playbackMode == PlaybackMode.FEED) {
-            player.seekTo(playlistIndex, feedAnchorPositionMs);
-            player.pause();
-            updatePlaybackChrome();
-            return;
-        }
-        int newIndex = player.getCurrentMediaItemIndex();
-        if (newIndex == playlistIndex || newIndex < 0 || newIndex >= playlist.size()) return;
-        if (current != null) {
-            resumePositions.remove(current.awemeId);
-            markVideoFullyWatched(current);
-        }
-        playlistIndex = newIndex;
-        refillPlaylist();
-        Long resumeMs = resumePositions.get(playlist.get(playlistIndex).awemeId);
-        if (resumeMs != null) {
-            player.seekTo(resumeMs);
-        }
-        applyCurrentUi();
-    }
-
-    /**
-     * Slides the whole content container off-screen, seeks the (already
-     * preloaded) player to the neighboring playlist item while it's
-     * off-screen, then slides it back in from the opposite edge - a
-     * TikTok-style directional transition without needing a second
-     * concurrent decoder (only one ExoPlayer instance is ever used, matching
-     * this project's "never waste a decode session" design goal).
+     * TikTok-style transition: freeze the outgoing video as a snapshot and
+     * slide it off-screen while the incoming video (already playing on the
+     * off-screen page) slides into view at the same time.
      *
-     * @param direction {@code 1} for next (content exits up top, enters from
-     *                  bottom), {@code -1} for previous (exits down, enters
-     *                  from top).
+     * @param direction {@code 1} for next (A exits up, B enters from bottom),
+     *                  {@code -1} for previous (A exits down, B enters from top).
      */
     private void advance(int direction) {
+        if (slideAnimating) return;
+
+        int newIndex = playlistIndex + direction;
+        if (newIndex < 0 || newIndex >= playlist.size()) return;
+
         if (playbackMode == PlaybackMode.FEED) {
             suppressFeedAutoAdvance = false;
             handler.removeCallbacks(releaseSuppressFeedAutoAdvanceRunnable);
         }
-        Runnable step = () -> {
-            rememberCurrentPosition();
-            playlistIndex += direction;
-            if (playlistIndex < 0 || playlistIndex >= playlist.size()) {
-                playlistIndex -= direction;
-                return;
-            }
-            if (direction > 0) {
-                refillPlaylist();
-            }
-            Long resumeMs = resumePositions.get(playlist.get(playlistIndex).awemeId);
-            player.seekTo(playlistIndex, resumeMs != null ? resumeMs : 0L);
-            applyCurrentUi();
-            player.play();
-        };
 
-        int height = contentContainer.getHeight();
-        if (playlistIndex < 0 || height == 0) {
-            step.run();
+        int height = slideHost.getHeight();
+        if (height == 0) {
+            advanceInstant(direction);
             return;
         }
-        contentContainer.animate().cancel();
-        contentContainer.animate()
+
+        slideAnimating = true;
+        pendingCoverDismiss = false;
+        rememberCurrentPosition();
+        playlistIndex = newIndex;
+        if (direction > 0) {
+            refillPlaylist();
+        }
+
+        FeedVideo incoming = playlist.get(playlistIndex);
+        current = incoming;
+
+        // Freeze the whole outgoing page (video + blurred pillarbox sides).
+        Bitmap frozen = pageOut.capturePageSnapshot();
+        pageOut.showSnapshot(frozen);
+        pageOut.detachPlayer();
+
+        // Seek while detached so the new surface never paints the old item.
+        Long resumeMs = resumePositions.get(incoming.awemeId);
+        player.seekTo(playlistIndex, resumeMs != null ? resumeMs : 0L);
+
+        // Stage the incoming video on the off-screen page.
+        float entryY = direction * height;
+        pageIn.resetForReuse(entryY);
+        pageIn.attachPlayer(player);
+        playerPage = pageIn;
+
+        applyIncomingCover(pageIn, incoming, () -> runDualPageSlide(direction, height));
+        applySharedUi(incoming);
+        player.play();
+    }
+
+    private void advanceInstant(int direction) {
+        rememberCurrentPosition();
+        playlistIndex += direction;
+        if (playlistIndex < 0 || playlistIndex >= playlist.size()) {
+            playlistIndex -= direction;
+            return;
+        }
+        if (direction > 0) refillPlaylist();
+        Long resumeMs = resumePositions.get(playlist.get(playlistIndex).awemeId);
+        player.seekTo(playlistIndex, resumeMs != null ? resumeMs : 0L);
+        applyCurrentUi();
+        player.play();
+    }
+
+    /**
+     * Loads the <em>incoming</em> video's cover + blurred backdrop onto the
+     * off-screen page and keeps the cover visible as a mask during the slide.
+     */
+    private void applyIncomingCover(VideoSlidePage page, FeedVideo video, Runnable whenReady) {
+        page.coverImage.animate().cancel();
+        page.coverImage.setAlpha(1f);
+        page.coverImage.setTag(video.coverUrl);
+        page.backdropImage.setTag(video.coverUrl);
+
+        final boolean[] done = {false};
+        final Runnable[] timeoutHolder = new Runnable[1];
+        Runnable ready = () -> {
+            if (done[0]) return;
+            if (video.coverUrl != null && !video.coverUrl.equals(page.coverImage.getTag())) return;
+            done[0] = true;
+            if (timeoutHolder[0] != null) {
+                handler.removeCallbacks(timeoutHolder[0]);
+            }
+            page.coverImage.setAlpha(1f);
+            whenReady.run();
+        };
+        timeoutHolder[0] = ready;
+
+        if (SimpleImageLoader.applyCachedCover(video.coverUrl, page.coverImage, page.backdropImage)) {
+            ready.run();
+            return;
+        }
+        SimpleImageLoader.loadWithBackdrop(
+                video.coverUrl, page.coverImage, page.backdropImage, ready);
+        handler.postDelayed(timeoutHolder[0], SLIDE_FRAME_WAIT_MS);
+    }
+
+    private void dismissCoverOnPlayerPage() {
+        if (playerPage == null) return;
+        playerPage.coverImage.animate().alpha(0f).setDuration(120).start();
+        pendingCoverDismiss = false;
+    }
+
+    private void runDualPageSlide(int direction, int height) {
+        pageOut.root.animate().cancel();
+        pageIn.root.animate().cancel();
+
+        pageOut.root.animate()
                 .translationY(-direction * height)
                 .setDuration(SLIDE_DURATION_MS)
-                .withEndAction(() -> {
-                    step.run();
-                    contentContainer.setTranslationY(direction * height);
-                    contentContainer.animate()
-                            .translationY(0)
-                            .setDuration(SLIDE_DURATION_MS)
-                            .start();
-                })
                 .start();
+
+        pageIn.root.animate()
+                .translationY(0)
+                .setDuration(SLIDE_DURATION_MS)
+                .withEndAction(() -> finishDualPageSlide(direction, height))
+                .start();
+    }
+
+    private void finishDualPageSlide(int direction, int height) {
+        pageOut.clearSnapshot();
+
+        VideoSlidePage tmp = pageOut;
+        pageOut = pageIn;
+        pageIn = tmp;
+
+        playerPage = pageOut;
+        playerView = pageOut.playerView;
+        coverImage = pageOut.coverImage;
+        backdropImage = pageOut.backdropImage;
+
+        pageOut.root.setTranslationY(0);
+        pageIn.resetForReuse(direction * height);
+        showActivePage();
+
+        slideAnimating = false;
+        if (pendingCoverDismiss) {
+            dismissCoverOnPlayerPage();
+        }
+        updatePlaybackChrome();
+        updateProgressUi();
     }
 
     /**
@@ -1409,6 +1525,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             if (next == null) break;
             playlist.add(next);
             player.addMediaItem(mediaItemFor(next));
+            SimpleImageLoader.preload(next.coverUrl);
         }
         trimPlaylistHead();
     }
@@ -1461,11 +1578,26 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private void applyCurrentUi() {
-        ensureFeedPumpForFeedPlayback();
+        if (playlistIndex < 0 || playlistIndex >= playlist.size()) return;
         FeedVideo video = playlist.get(playlistIndex);
         current = video;
-        coverImage.setAlpha(1f);
-        SimpleImageLoader.loadWithBackdrop(video.coverUrl, coverImage, backdropImage);
+        applyPageVisuals(pageOut, video);
+        applySharedUi(video);
+    }
+
+    private void applyPageVisuals(VideoSlidePage page, FeedVideo video) {
+        page.coverImage.animate().cancel();
+        page.coverImage.setAlpha(1f);
+        if (SimpleImageLoader.applyCachedCover(video.coverUrl, page.coverImage, page.backdropImage)) {
+            // cover ready
+        } else {
+            SimpleImageLoader.loadWithBackdrop(video.coverUrl, page.coverImage, page.backdropImage);
+        }
+        SimpleImageLoader.preload(video.coverUrl);
+    }
+
+    private void applySharedUi(FeedVideo video) {
+        ensureFeedPumpForFeedPlayback();
         SimpleImageLoader.load(video.authorAvatarUrl, avatarImage);
         updateInfoPanel(video);
         updateLikeUi(video);
@@ -1620,7 +1752,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     /**
      * Feed data arrived while the user paused: queue/prepare without starting
-     * playback, and preload a slice of upcoming items in the background.
+     * playback, and fully preload upcoming items in the background.
      */
     private void prepareFeedWhilePaused() {
         if (playlistIndex < 0) {
@@ -1828,11 +1960,25 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
         playlist.clear();
         player.clearMediaItems();
+        slideAnimating = false;
+        pageOut.clearSnapshot();
+        pageIn.clearSnapshot();
+        pageOut.attachPlayer(player);
+        pageIn.detachPlayer();
+        pageOut.root.setTranslationY(0);
+        playerPage = pageOut;
+        playerView = pageOut.playerView;
+        coverImage = pageOut.coverImage;
+        backdropImage = pageOut.backdropImage;
+        showActivePage();
+        slideHost.post(() -> pageIn.resetForReuse(slideHost.getHeight()));
+
         playlist.addAll(videos);
         playlistIndex = index;
 
         for (FeedVideo video : playlist) {
             player.addMediaItem(mediaItemFor(video));
+            SimpleImageLoader.preload(video.coverUrl);
         }
 
         player.seekTo(playlistIndex, 0);
@@ -1909,6 +2055,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             if (!playlistContains(video.awemeId)) {
                 playlist.add(video);
                 player.addMediaItem(mediaItemFor(video));
+                SimpleImageLoader.preload(video.coverUrl);
             }
         }
         if (playlist.size() - (playlistIndex + 1) < PRELOAD_AHEAD && creatorRepository.hasMore()) {
