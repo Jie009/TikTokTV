@@ -23,7 +23,15 @@ public final class DouyinConstants {
                     + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
     public static final String FEED_URL = "https://www.douyin.com/";
+    /** PC 精选 — logged-in sessions reliably trigger the feed pipeline here. */
+    public static final String JINGXUAN_FEED_URL = "https://www.douyin.com/jingxuan";
     public static final String REFERER = "https://www.douyin.com/";
+
+    /** Anonymous cold start uses home; logged-in uses 精选 for faster feed APIs. */
+    public static String pumpStartUrl(boolean loggedIn) {
+        return loggedIn ? JINGXUAN_FEED_URL : FEED_URL;
+    }
+
     public static final String ORIGIN = "https://www.douyin.com";
 
     /** Logical desktop viewport the pump WebView presents to douyin.com. */

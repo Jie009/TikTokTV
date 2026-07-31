@@ -104,7 +104,7 @@ public final class FeedPumpController implements PageRequester {
 
     private static final long[] KICKSTART_DELAYS_PHONE_MS = {800, 2_000, 5_000, 10_000};
 
-    private static final long[] KICKSTART_DELAYS_TV_MS = {800, 2_000, 5_000, 10_000, 20_000, 35_000, 50_000};
+    private static final long[] KICKSTART_DELAYS_TV_MS = {800, 2_000, 4_000, 8_000, 12_000, 18_000, 25_000};
 
     private static final long PAGE_INTERACTIVE_FALLBACK_MS = 20_000;
 
@@ -186,6 +186,8 @@ public final class FeedPumpController implements PageRequester {
 
     private boolean loggedIn = false;
 
+    private boolean feedApiSeen = false;
+
     private boolean historySyncRequested = false;
 
     private boolean pendingHistorySync = false;
@@ -229,6 +231,8 @@ public final class FeedPumpController implements PageRequester {
             WatchedAwemeStore.getInstance().bindSession();
 
         }
+
+        injectLoggedInFlag();
 
     }
 
@@ -364,6 +368,14 @@ public final class FeedPumpController implements PageRequester {
 
     private void nudgePageForFeed() {
 
+        nudgePageForFeed(false);
+
+    }
+
+
+
+    private void nudgePageForFeed(boolean forceInitial) {
+
         if (webView == null || pageFetchInFlight) return;
 
         if (awaitingLiteJsonFeed) {
@@ -376,7 +388,7 @@ public final class FeedPumpController implements PageRequester {
 
         boolean paginate = paginationState.isReady();
 
-        if (!paginate && apiCallsSeen == 0) {
+        if (!paginate && apiCallsSeen == 0 && !forceInitial) {
 
             Log.d(TAG, "deferring initial nudge until page runtime is alive");
 
@@ -394,7 +406,9 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-        String script = paginate ? FeedHookScripts.TRIGGER_PAGE_FEED : FeedHookScripts.TRIGGER_INITIAL_FEED;
+        String script = paginate
+                ? FeedHookScripts.TRIGGER_PAGE_FEED
+                : FeedHookScripts.TRIGGER_INITIAL_FEED;
 
         if (paginate) {
 
@@ -417,6 +431,8 @@ public final class FeedPumpController implements PageRequester {
     private void handleLiteFeedBinary(String url) {
 
         if (repository.bufferSize() > 0) return;
+
+        feedApiSeen = true;
 
         paginationState.seedFromUrl(url);
 
@@ -538,6 +554,40 @@ public final class FeedPumpController implements PageRequester {
 
 
 
+    /**
+     * After cookie login: reload home in-place so the same anonymous feed
+     * pipeline runs with session cookies attached.
+     */
+    public void softReloadAfterLogin() {
+
+        cancelKickstart();
+
+        stopHookTicker();
+
+        cancelPageInteractiveFallback();
+
+        resetPumpSession();
+
+        feedApiSeen = false;
+
+        notifyStatus("登录成功，正在刷新推荐…");
+
+        if (webView != null) {
+
+            injectLoggedInFlag();
+
+            webView.loadUrl(DouyinConstants.pumpStartUrl(loggedIn));
+
+        } else {
+
+            createWebView();
+
+        }
+
+    }
+
+
+
     private void resetPumpSession() {
 
         apiCallsSeen = 0;
@@ -559,6 +609,8 @@ public final class FeedPumpController implements PageRequester {
         pageFetchTimeoutExtensions = 0;
 
         awaitingLiteJsonFeed = false;
+
+        feedApiSeen = false;
 
         historyFetchInFlight = false;
 
@@ -638,7 +690,7 @@ public final class FeedPumpController implements PageRequester {
 
         settings.setDomStorageEnabled(true);
 
-        settings.setMediaPlaybackRequiresUserGesture(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
 
         settings.setUserAgentString(DouyinConstants.DESKTOP_USER_AGENT);
 
@@ -750,6 +802,12 @@ public final class FeedPumpController implements PageRequester {
 
                 markPageInteractive("页面已加载，等待视频…");
 
+                if (loggedIn && repository.bufferSize() == 0 && !feedApiSeen) {
+
+                    scrapeEmbeddedFeed();
+
+                }
+
             }
 
 
@@ -758,16 +816,20 @@ public final class FeedPumpController implements PageRequester {
 
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
 
-                if (request != null) {
-
-                    String url = request.getUrl().toString();
-
-                    if (isFeedApiUrl(url)) {
-
-                        handler.post(() -> apiCallsSeen++);
-
-                    }
-
+                WebResourceResponse mirrored = FeedResponseInterceptor.mirror(
+                        request,
+                        (url, status, body) -> handler.post(() -> {
+                            apiCallsSeen++;
+                            Log.d(TAG, "mirrored feed api: " + url + " status=" + status
+                                    + " bytes=" + (body != null ? body.length() : 0));
+                            if (status == 200 && body != null && !body.isEmpty()) {
+                                handleFeedData(url, body);
+                            } else if (isAlternateAwemeListUrl(url)) {
+                                handler.postDelayed(() -> scrapeEmbeddedFeed(), 800);
+                            }
+                        }));
+                if (mirrored != null) {
+                    return mirrored;
                 }
 
                 return super.shouldInterceptRequest(view, request);
@@ -868,7 +930,7 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-        webView.loadUrl(DouyinConstants.FEED_URL);
+        webView.loadUrl(DouyinConstants.pumpStartUrl(loggedIn));
 
     }
 
@@ -1076,6 +1138,29 @@ public final class FeedPumpController implements PageRequester {
 
 
 
+    /** Logged-in pages often skip module/feed but still return playable lists here. */
+    private static boolean isAlternateAwemeListUrl(String url) {
+
+        if (url == null || !url.contains("douyin.com")) return false;
+
+        return url.contains("/aweme/favorite")
+
+                || url.contains("/aweme/post")
+
+                || url.contains("/mix/listcollection");
+
+    }
+
+
+
+    private static boolean acceptsAwemeListCapture(String url) {
+
+        return isFeedApiUrl(url) || isAlternateAwemeListUrl(url);
+
+    }
+
+
+
     private static boolean isHistoryApiUrl(String url) {
 
         return url != null && url.contains("douyin.com") && url.contains("history/read");
@@ -1158,11 +1243,18 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-        Log.d(TAG, "feed kickstart attempt " + attempt + " apiCallsSeen=" + apiCallsSeen);
+        Log.d(TAG, "feed kickstart attempt " + attempt + " apiCallsSeen=" + apiCallsSeen
+                + " feedApiSeen=" + feedApiSeen + " loggedIn=" + loggedIn);
 
         injectHooks();
 
-        if (apiCallsSeen > 0 && !paginationState.isReady() && !awaitingLiteJsonFeed) {
+        if (apiCallsSeen == 0 && !pageFetchInFlight && !awaitingLiteJsonFeed) {
+
+            repository.releasePageRequest();
+
+            nudgePageForFeed(true);
+
+        } else if (apiCallsSeen > 0 && !paginationState.isReady() && !awaitingLiteJsonFeed) {
 
             repository.releasePageRequest();
 
@@ -1171,6 +1263,12 @@ public final class FeedPumpController implements PageRequester {
         }
 
         probePageState();
+
+        if (loggedIn && !feedApiSeen && repository.bufferSize() == 0) {
+
+            scrapeEmbeddedFeed();
+
+        }
 
 
 
@@ -1212,6 +1310,16 @@ public final class FeedPumpController implements PageRequester {
 
 
 
+    private void scrapeEmbeddedFeed() {
+
+        if (webView == null || feedApiSeen || repository.bufferSize() > 0) return;
+
+        webView.evaluateJavascript(FeedHookScripts.SCRAPE_EMBEDDED_FEED, null);
+
+    }
+
+
+
     private void setupServiceWorkerInterception() {
 
         try {
@@ -1244,9 +1352,23 @@ public final class FeedPumpController implements PageRequester {
 
 
 
+    private void injectLoggedInFlag() {
+
+        if (webView != null) {
+
+            webView.evaluateJavascript("window.__tvdyPumpLoggedIn=" + loggedIn + ";", null);
+
+        }
+
+    }
+
+
+
     private void injectHooks() {
 
         if (webView != null) {
+
+            injectLoggedInFlag();
 
             webView.evaluateJavascript(FeedHookScripts.INSTALL_HOOKS, null);
 
@@ -1312,7 +1434,17 @@ public final class FeedPumpController implements PageRequester {
 
                 apiCallsSeen++;
 
+                if (isFeedApiUrl(url)) {
+                    feedApiSeen = true;
+                }
+
                 Log.d(TAG, "saw api call: " + url + " (" + note + ")");
+
+                if (isAlternateAwemeListUrl(url) && repository.bufferSize() == 0) {
+
+                    handler.postDelayed(() -> FeedPumpController.this.scrapeEmbeddedFeed(), 800);
+
+                }
 
                 if (pageFetchInFlight) {
 
@@ -1438,9 +1570,61 @@ public final class FeedPumpController implements PageRequester {
 
 
 
+    private static JSONArray extractAwemeList(JSONObject root) throws org.json.JSONException {
+
+        JSONArray list = root.optJSONArray("aweme_list");
+
+        if (list != null && list.length() > 0) {
+
+            return list;
+
+        }
+
+        JSONArray collections = root.optJSONArray("collection_list");
+
+        if (collections != null && collections.length() > 0) {
+
+            JSONArray merged = new JSONArray();
+
+            for (int i = 0; i < collections.length(); i++) {
+
+                JSONObject item = collections.optJSONObject(i);
+
+                if (item == null) continue;
+
+                JSONArray inner = item.optJSONArray("aweme_list");
+
+                if (inner == null) continue;
+
+                for (int j = 0; j < inner.length(); j++) {
+
+                    merged.put(inner.get(j));
+
+                }
+
+            }
+
+            if (merged.length() > 0) {
+
+                return merged;
+
+            }
+
+        }
+
+        return list;
+
+    }
+
+
+
     private void handleFeedData(String url, String json) {
 
         if (json == null || json.isEmpty()) return;
+
+        if (isFeedApiUrl(url) || isAlternateAwemeListUrl(url)) {
+            feedApiSeen = true;
+        }
 
         String trimmed = json.trim();
 
@@ -1472,7 +1656,7 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-            if (!isFeedApiUrl(url)) {
+            if (!acceptsAwemeListCapture(url)) {
 
                 return;
 
@@ -1480,27 +1664,41 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-            paginationState.updateFromCapture(url, root);
-
-
-
-            JSONArray list = root.optJSONArray("aweme_list");
+            JSONArray list = extractAwemeList(root);
 
             if (list == null || list.length() == 0) {
 
-                Log.d(TAG, "empty aweme_list from " + url
+                if (isFeedApiUrl(url)) {
 
-                        + " status_code=" + root.optInt("status_code", -1));
+                    paginationState.updateFromCapture(url, root);
 
-                onFeedCaptureComplete();
+                    Log.d(TAG, "empty aweme_list from " + url
 
-                if (paginationState.hasMore() && repository.bufferSize() < PUMP_LOW_WATER_MARK) {
+                            + " status_code=" + root.optInt("status_code", -1));
 
-                    handler.postDelayed(this::requestNextPage, 1_000);
+                    onFeedCaptureComplete();
+
+                    if (paginationState.hasMore() && repository.bufferSize() < PUMP_LOW_WATER_MARK) {
+
+                        handler.postDelayed(this::requestNextPage, 1_000);
+
+                    }
 
                 }
 
                 return;
+
+            }
+
+
+
+            if (isFeedApiUrl(url)) {
+
+                paginationState.updateFromCapture(url, root);
+
+            } else {
+
+                Log.d(TAG, "logged-in aweme_list from " + url + " count=" + list.length());
 
             }
 

@@ -296,10 +296,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 Log.w(TAG, "pump error: " + message);
             }
         });
-        pump.start((ViewGroup) findViewById(R.id.playerRoot));
         if (hasSavedSession()) {
             pump.setLoggedIn(true);
         }
+        pump.start((ViewGroup) findViewById(R.id.playerRoot));
 
         // Session cookies are injected per-request in DouyinHttpDataSource.
         DouyinHttpDataSource.Factory httpDataSourceFactory = new DouyinHttpDataSource.Factory();
@@ -590,9 +590,11 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         coverImage.setAlpha(1f);
         scheduleStartupTimeout();
         pump.setLoggedIn(loggedIn);
-        pump.hardRestart();
         if (loggedIn) {
+            pump.softReloadAfterLogin();
             pump.scheduleWatchHistorySync();
+        } else {
+            pump.hardRestart();
         }
         updatePlaybackChrome();
     }
