@@ -1,52 +1,227 @@
 # TV DY
 
-抖音 TV 版，遥控器刷抖音。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Android%20TV%20%7C%20TV%20Box-green.svg)](app/src/main/AndroidManifest.xml)
+[![minSdk](https://img.shields.io/badge/minSdk-21-orange.svg)](app/build.gradle.kts)
+[![targetSdk](https://img.shields.io/badge/targetSdk-35-orange.svg)](app/build.gradle.kts)
 
-本 fork 以轻量 WebView 方案为主，目标是优先保证电视遥控器可用、登录流程不被打断、上下刷视频尽量稳定。
+在 Android TV、电视盒子、投影仪上用遥控器刷抖音。
 
-## 按键说明
+TV DY 采用 **原生 ExoPlayer 播放 + 隐藏 WebView 数据泵** 的混合架构：后台 WebView 加载 douyin.com 并拦截页面自带的 feed 接口响应，提取带有效签名的视频流地址；前台用 ExoPlayer 全屏播放，上下切换带 TikTok 式滑动动画，专为遥控器操作优化。
+
+> 本项目为第三方开源客户端，与抖音官方无任何关联。仅供学习交流，请遵守相关法律法规与平台服务条款。
+
+---
+
+## 功能特性
+
+- **原生播放** — Media3 ExoPlayer 直链播放，预加载后续 5 条视频，弱网环境下缓冲策略针对 TV 优化
+- **Feed 数据泵** — 隐藏 WebView 被动捕获页面 fetch/XHR 的 feed JSON，不自行伪造签名请求，分页由页面滚动触发
+- **遥控器导航** — 上下切视频、左右快进/快退、OK 键播放/暂停与功能菜单
+- **Cookie 登录** — 手机/电脑扫码提交浏览器 Cookie，无需在电视上输入长字符串
+- **创作者作品** — 登录后可浏览当前视频作者的全部作品并点播
+- **已看过滤** — 记录账号历史与本机播放过的视频，feed 缓冲中自动跳过
+- **TV 适配** — 支持 Leanback Launcher；TV 设备启动超时自动延长；横屏全屏沉浸
+
+---
+
+## 架构概览
+
+```mermaid
+flowchart LR
+    subgraph 后台
+        WV[隐藏 WebView<br/>FeedPumpController]
+        FR[FeedRepository]
+        WV -->|拦截 feed JSON| FR
+    end
+
+    subgraph 前台
+        PA[PlayerActivity]
+        EP[ExoPlayer]
+        PA --> EP
+        FR -->|视频列表| PA
+    end
+
+    subgraph 登录
+        CHS[CookieHandoffServer<br/>:8899]
+        CIH[CookieImportHelper]
+        CHS --> CIH --> WV
+    end
+
+    CDN[(douyinvod CDN)] --> EP
+    WV -->|Cookie / 签名| CDN
+```
+
+| 模块 | 说明 |
+|------|------|
+| `FeedPumpController` | 隐藏 WebView，Hook fetch/XHR，捕获 feed 与分页数据 |
+| `FeedRepository` | 视频缓冲队列，供播放器消费 |
+| `PlayerActivity` | 唯一界面：播放、遥控器、菜单、登录 |
+| `CookieHandoffServer` | 局域网 HTTP 服务，接收手机/PC 提交的 Cookie |
+| `WatchedAwemeStore` | 按 session 持久化已看视频 ID |
+| `CreatorVideoRepository` | 创作者主页作品列表 |
+
+---
+
+## 截图
+
+| 启动加载 | 视频播放 |
+|:---:|:---:|
+| ![启动加载](docs/screenshots/loading.png) | ![视频播放](docs/screenshots/playback.png) |
+| Feed 数据泵等待首条视频 | 标题、作者、进度条与互动数据 |
+
+| 功能菜单 | 创作者作品 |
+|:---:|:---:|
+| ![功能菜单](docs/screenshots/menu.png) | ![创作者作品](docs/screenshots/creator-grid.png) |
+| 长按 OK 打开，登录后可查看博主作品 | 4 列网格浏览作者全部视频 |
+
+---
+
+## 环境要求
+
+| 项目 | 版本 |
+|------|------|
+| Android Studio | Ladybug 或更高（AGP 8.12+） |
+| JDK | 11 |
+| compileSdk / targetSdk | 35 |
+| minSdk | 21（Android 5.0+） |
+| 设备 | Android TV、电视盒子，或带遥控器的 Android 设备 |
+
+---
+
+## 构建与安装
+
+```bash
+# 克隆仓库
+git clone https://github.com/Jie009/TikTokTV.git
+cd TikTokTV
+
+# 构建 Debug APK
+./gradlew assembleDebug
+
+# 安装到已连接设备（需开启 USB 调试或 adb 网络连接）
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Windows 下可使用 `gradlew.bat assembleDebug`。
+
+Release 构建：
+
+```bash
+./gradlew assembleRelease
+```
+
+---
+
+## 遥控器操作
+
+### 播放界面
 
 | 按键 | 功能 |
 |------|------|
-| 上/下 | 切换视频 |
-| OK 短按 | 播放 / 暂停 |
-| OK 长按 | 进入 / 退出光标模式 |
-| 左/右 | 后退 / 快进 5 秒 |
-| 菜单 | 进入 / 退出光标模式 |
-| 返回 | 双击退出 |
+| **上 / 下** | 上一条 / 下一条视频 |
+| **OK 短按** | 显示信息栏；播放中再次短按暂停；暂停时短按恢复 |
+| **OK 长按** | 打开功能菜单 |
+| **左 / 右** | 后退 / 快进 5 秒（按住连续 seek） |
+| **返回** | 先关闭信息栏 / 菜单 / 登录页；连按两次退出应用 |
+| **播放/暂停键** | 切换播放状态 |
 
-## 光标模式
+播放时信息栏（标题、作者、进度、点赞/收藏/评论数）会在 3 秒后自动隐藏。
 
-按菜单键或长按 OK 进入光标模式后：
+### 功能菜单
 
-| 按键 | 功能 |
-|------|------|
-| 上/下/左/右 | 移动光标 |
-| OK 短按 | 点击当前位置 |
-| OK 长按 | 退出光标模式 |
-| 菜单 / 返回 | 退出光标模式 |
+长按 OK 进入菜单，**上 / 下** 选择，**OK** 确认，**返回** 关闭。
 
-## 当前改造
+| 菜单项 | 状态 | 说明 |
+|--------|------|------|
+| 登录账号 | ✅ | Cookie 扫码登录 |
+| 创作者作品 | ✅ | 浏览当前作者的全部视频 |
+| 我的喜欢 | 🚧 | 开发中 |
+| 我的关注 | 🚧 | 开发中 |
+| 我的评论 | 🚧 | 开发中 |
+| 退出登录 | ✅ | 清除 Cookie 并恢复匿名 feed |
 
-- 放开抖音登录、账号、OAuth 等页面跳转，避免扫码或账号登录时被强制跳回推荐页。
-- 上/下键增加防抖，减少电视遥控器连发导致一次跳多条视频。
-- 上/下键优先发送网页快捷键；如果页面没有响应，再补一次整屏滚动。
-- 左/右键发送网页原生 ArrowLeft / ArrowRight，让抖音播放器自己处理后退 / 快进。
-- 补充 WebView 的 Cookie、DOM Storage、硬件加速和视频播放相关配置。
-- 参考 `ygtec-org/douyin-tv` 的方式实现稳定伪全屏：选中当前可见 video，固定铺满 `100vw/100vh`，比点击网页全屏按钮更可靠。
-- 针对电视观看放大 WebView 字体、遥控器提示和功能轮盘文字。
-- 新增光标模式，可用遥控器移动光标并点击页面任意位置。
-- 默认尝试打开网页自带 Autoplay 开关，并监听 video 结束后自动触发下一条。
-- 页面检测到 video 后等待 10 秒，自动进入 video 伪全屏；上下切换时会临时退出并重新铺满新视频。
-- 适配小米盒子等少按钮遥控器：没有菜单键时可用 OK 长按进入/退出光标模式。
-- 增加轻量 TV 模式：减少网页动画/模糊效果，节流 DOM 监听，并尝试自动选择 720p/标清/流畅等较低画质。
+---
 
-<img width="2176" height="1224" alt="MuMu20260610133333" src="https://github.com/user-attachments/assets/5c459737-44d6-4f4d-afda-22ddf39d04ed" />
-<img width="2176" height="1224" alt="MuMu20260610133403" src="https://github.com/user-attachments/assets/472199fb-24c6-48ca-bdb7-e297fe869e02" />
-<img width="2176" height="1224" alt="MuMu20260610133429" src="https://github.com/user-attachments/assets/94a4f3f1-4801-472e-98a2-87b336ab3c0d" />
-<img width="2176" height="1224" alt="MuMu20260610133459" src="https://github.com/user-attachments/assets/1ec48712-828d-4c8d-9834-aa79c39ee0f1" />
+## 登录说明
 
+抖音网页登录带有滑块验证码，TV 端无法直接完成登录，因此采用 **Cookie 导入** 方式：
 
+1. 在电脑或手机浏览器登录 [douyin.com](https://www.douyin.com)
+2. 打开开发者工具 → Network，复制任意请求的完整 `Cookie` 请求头
+3. 在 TV 上 **长按 OK** → 选择 **登录账号**
+4. 用手机扫描屏幕上的二维码（需与 TV 在同一局域网）
+5. 在打开的网页表单中粘贴 Cookie 并提交
+6. App 会向抖音服务器验证 session 有效性，成功后自动刷新 feed
 
+### ADB 脚本（开发调试）
 
+项目提供了 PowerShell 脚本，可通过 adb reverse 直接向本机 `8899` 端口提交 Cookie：
 
+```powershell
+# 前提：App 已打开登录界面并等待提交
+.\scripts\inject-cookie.ps1 -CookieFile .cursor\tmp_cookie.txt
+```
+
+---
+
+## 项目结构
+
+```
+app/src/main/java/mulin/tvdy/
+├── player/          # PlayerActivity、ExoPlayer、滑动切换、创作者网格
+├── pump/            # FeedPumpController、XHR 拦截、分页状态
+├── data/            # FeedRepository、FeedVideo、已看记录
+├── auth/            # Cookie 导入、登录验证、QR 码、局域网 Handoff
+├── api/             # Native feed 客户端与签名服务
+├── feed/            # Feed 控制器抽象
+├── DouyinConstants.java   # UA、Referer、请求头
+├── DeviceUtils.java       # TV 设备检测
+└── TvdyApplication.java   # WebView 预热
+```
+
+---
+
+## 技术栈
+
+- [AndroidX Media3 ExoPlayer](https://developer.android.com/media/media3) — 视频播放
+- [AndroidX WebKit](https://developer.android.com/develop/ui/views/layout/webapps) — WebView 兼容层
+- [ZXing](https://github.com/zxing/zxing) — 登录二维码生成
+- [Lottie](https://airbnb.io/lottie/) — 启动与加载动画
+
+---
+
+## 常见问题
+
+**启动后长时间停留在加载页？**  
+Feed 数据泵需要 WebView 加载 douyin.com 并等待页面发起 feed 请求。TV 设备网络较慢时最长等待约 2 分钟，超时后可短按 OK 重试。登录状态下会优先打开「精选」页以加快 feed 触发。
+
+**视频无法播放？**  
+CDN 直链需要正确的 Referer 与 Cookie。请确认已登录且 Cookie 未过期；匿名模式下部分视频可能受限。
+
+**登录二维码无法生成？**  
+需确保 TV 已连接 Wi-Fi 或以太网，且手机与 TV 在同一局域网。
+
+**点赞/收藏能否操作？**  
+当前仅展示抖音返回的统计数据，暂不支持通过遥控器点赞、收藏或评论。
+
+---
+
+## 免责声明
+
+- 本软件按「现状」提供，不提供任何明示或暗示的保证
+- 使用本软件产生的任何后果由使用者自行承担
+- 请尊重内容创作者版权，勿用于商业用途或大规模爬取
+- 「抖音」及相关商标归字节跳动所有
+
+---
+
+## 开源协议
+
+[MIT License](LICENSE) — Copyright (c) 2025 yemulin
+
+---
+
+## 致谢
+
+- 参考了 [ygtec-org/douyin-tv](https://github.com/ygtec-org/douyin-tv) 等社区项目的 TV 适配思路
