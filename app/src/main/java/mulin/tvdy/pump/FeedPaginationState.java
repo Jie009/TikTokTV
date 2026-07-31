@@ -58,8 +58,8 @@ final class FeedPaginationState {
             Log.w(TAG, "failed to parse refresh_index from url", e);
         }
 
-        if (bootstrapped && urlRefreshIndex > 0 && urlRefreshIndex + 1 < refreshIndex) {
-            Log.d(TAG, "ignoring stale capture refresh_index=" + urlRefreshIndex
+        if (bootstrapped && urlRefreshIndex > 0 && urlRefreshIndex + 1 <= refreshIndex) {
+            Log.d(TAG, "ignoring duplicate capture refresh_index=" + urlRefreshIndex
                     + " (next=" + refreshIndex + ")");
             return;
         }
@@ -109,5 +109,27 @@ final class FeedPaginationState {
         hasMore = true;
         tabFeed = false;
         bootstrapped = false;
+    }
+
+    /** Bootstrap pagination state from a lite-binary feed URL we could not parse. */
+    void seedFromUrl(String url) {
+        if (url == null || url.isEmpty()) return;
+
+        int urlRefreshIndex = 0;
+        try {
+            Uri uri = Uri.parse(url);
+            String refreshParam = uri.getQueryParameter("refresh_index");
+            if (refreshParam != null && !refreshParam.isEmpty()) {
+                urlRefreshIndex = Integer.parseInt(refreshParam);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "failed to parse refresh_index from seed url", e);
+        }
+
+        lastFeedUrl = url;
+        bootstrapped = true;
+        tabFeed = url.contains("/tab/feed");
+        refreshIndex = urlRefreshIndex > 0 ? urlRefreshIndex + 1 : 2;
+        Log.d(TAG, "seeded from lite url refresh_index=" + refreshIndex);
     }
 }
