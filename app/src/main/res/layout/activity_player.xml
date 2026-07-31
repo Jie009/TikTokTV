@@ -281,7 +281,7 @@
          the shell + open/close (via back) is wired up for now. -->
     <LinearLayout
         android:id="@+id/featureMenu"
-        android:layout_width="260dp"
+        android:layout_width="280dp"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
         android:background="@drawable/bg_menu_panel"
@@ -289,71 +289,150 @@
         android:padding="8dp"
         android:visibility="gone">
 
-        <!-- Default state ("登录账号", no avatar) opens
-             PlayerActivity#startCookieLogin's QR/Cookie overlay - the only
-             login method the app offers, since douyin's own web login (QR
-             modal or otherwise) is guarded by an anti-bot captcha a hidden
-             WebView can never solve. Once PlayerActivity#setLoginState
-             confirms a real session (via LoginStatusChecker), this row
-             instead shows that account's avatar + nickname, and selecting
-             it logs out (PlayerActivity#logout) rather than reopening the
-             login flow. -->
         <LinearLayout
-            android:id="@+id/featureMenuLogin"
+            android:id="@+id/featureMenuAccountHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center_vertical"
             android:orientation="horizontal"
             android:paddingStart="18dp"
-            android:paddingTop="11dp"
+            android:paddingTop="14dp"
             android:paddingEnd="18dp"
-            android:paddingBottom="11dp">
+            android:paddingBottom="10dp"
+            android:visibility="gone">
 
             <ImageView
-                android:id="@+id/featureMenuLoginAvatar"
-                android:layout_width="30dp"
-                android:layout_height="30dp"
-                android:layout_marginEnd="10dp"
+                android:id="@+id/featureMenuAccountAvatar"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:background="#33FFFFFF"
                 android:contentDescription="@null"
-                android:visibility="gone" />
+                android:scaleType="centerCrop" />
 
-            <TextView
-                android:id="@+id/featureMenuLoginText"
+            <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
                 android:layout_weight="1"
-                android:ellipsize="end"
-                android:maxLines="1"
-                android:text="登录账号"
-                android:textColor="#FFFFFF"
-                android:textSize="16sp" />
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/featureMenuAccountName"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:textColor="#FFFFFF"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="已登录"
+                    android:textColor="#99FFFFFF"
+                    android:textSize="12sp" />
+
+            </LinearLayout>
 
         </LinearLayout>
 
-        <!-- Re-runs PlayerActivity#checkLoginStatus on demand - lets the user
-             confirm at any later point (e.g. days after logging in) whether
-             the session douyin's servers hold is still actually valid,
-             rather than only ever finding out passively when the feed
-             happens to look wrong. -->
-        <TextView
-            android:id="@+id/featureMenuCheckLogin"
-            style="@style/FeatureMenuItem"
-            android:text="检测登录状态" />
+        <View
+            android:id="@+id/featureMenuAccountDivider"
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginStart="18dp"
+            android:layout_marginEnd="18dp"
+            android:layout_marginBottom="4dp"
+            android:background="#33FFFFFF"
+            android:visibility="gone" />
 
-        <TextView
+        <LinearLayout
+            android:id="@+id/featureMenuLogin"
+            style="@style/FeatureMenuRow">
+
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_account" />
+
+            <TextView
+                android:id="@+id/featureMenuLoginText"
+                style="@style/FeatureMenuLabel"
+                android:text="登录账号" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/featureMenuCreator"
+            style="@style/FeatureMenuRow">
+
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_creator" />
+
+            <TextView
+                style="@style/FeatureMenuLabel"
+                android:text="查看博主作品" />
+
+        </LinearLayout>
+
+        <LinearLayout
             android:id="@+id/featureMenuLike"
-            style="@style/FeatureMenuItem"
-            android:text="点赞" />
+            style="@style/FeatureMenuRow">
 
-        <TextView
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_like" />
+
+            <TextView
+                style="@style/FeatureMenuLabel"
+                android:text="点赞" />
+
+        </LinearLayout>
+
+        <LinearLayout
             android:id="@+id/featureMenuFollow"
-            style="@style/FeatureMenuItem"
-            android:text="关注作者" />
+            style="@style/FeatureMenuRow">
 
-        <TextView
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_follow" />
+
+            <TextView
+                style="@style/FeatureMenuLabel"
+                android:text="关注作者" />
+
+        </LinearLayout>
+
+        <LinearLayout
             android:id="@+id/featureMenuComments"
-            style="@style/FeatureMenuItem"
-            android:text="查看评论" />
+            style="@style/FeatureMenuRow">
+
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_comment" />
+
+            <TextView
+                style="@style/FeatureMenuLabel"
+                android:text="查看评论" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/featureMenuLogout"
+            style="@style/FeatureMenuRow"
+            android:visibility="gone">
+
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_logout" />
+
+            <TextView
+                style="@style/FeatureMenuLabel"
+                android:text="退出登录" />
+
+        </LinearLayout>
 
     </LinearLayout>
 
@@ -516,5 +595,7 @@
         </LinearLayout>
 
     </FrameLayout>
+
+    <include layout="@layout/overlay_creator_grid" />
 
 </FrameLayout>

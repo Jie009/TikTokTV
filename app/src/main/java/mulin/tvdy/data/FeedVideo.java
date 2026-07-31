@@ -23,6 +23,9 @@ public final class FeedVideo {
     public final List<String> playUrlCandidates;
     public final String authorName;
     public final String authorAvatarUrl;
+    /** Douyin author.sec_uid — opens {@code /user/{sec_uid}} profile pages. */
+    public final String authorSecUid;
+    public final String authorUniqueId;
 
     /**
      * Server-reported counts at the time this item was fetched. Display
@@ -38,6 +41,7 @@ public final class FeedVideo {
     private FeedVideo(String awemeId, String desc, String coverUrl, String playUrl,
                       List<String> playUrlCandidates,
                       String authorName, String authorAvatarUrl,
+                      String authorSecUid, String authorUniqueId,
                       long diggCount, long commentCount, long collectCount, long shareCount) {
         this.awemeId = awemeId;
         this.desc = desc;
@@ -46,6 +50,8 @@ public final class FeedVideo {
         this.playUrlCandidates = playUrlCandidates;
         this.authorName = authorName;
         this.authorAvatarUrl = authorAvatarUrl;
+        this.authorSecUid = authorSecUid;
+        this.authorUniqueId = authorUniqueId;
         this.diggCount = diggCount;
         this.commentCount = commentCount;
         this.collectCount = collectCount;
@@ -101,6 +107,8 @@ public final class FeedVideo {
 
         JSONObject author = item.optJSONObject("author");
         String authorName = author != null ? author.optString("nickname", "") : "";
+        String authorSecUid = author != null ? author.optString("sec_uid", "") : "";
+        String authorUniqueId = author != null ? author.optString("unique_id", "") : "";
         String authorAvatarUrl = null;
         if (author != null) {
             authorAvatarUrl = firstUrl(author.optJSONObject("avatar_thumb"));
@@ -115,7 +123,7 @@ public final class FeedVideo {
         long shareCount = statistics != null ? statistics.optLong("share_count", 0) : 0;
 
         return new FeedVideo(awemeId, desc, coverUrl, playUrl, candidates,
-                authorName, authorAvatarUrl,
+                authorName, authorAvatarUrl, authorSecUid, authorUniqueId,
                 diggCount, commentCount, collectCount, shareCount);
     }
 

@@ -32,6 +32,10 @@ public final class DouyinConstants {
         return loggedIn ? JINGXUAN_FEED_URL : FEED_URL;
     }
 
+    public static String creatorProfileUrl(String secUid) {
+        return FEED_URL + "user/" + secUid;
+    }
+
     public static final String ORIGIN = "https://www.douyin.com";
 
     /** Logical desktop viewport the pump WebView presents to douyin.com. */
