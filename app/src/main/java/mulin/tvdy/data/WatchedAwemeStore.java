@@ -75,20 +75,36 @@ public final class WatchedAwemeStore {
     }
 
     /** Parses a {@code history/read} (or similar) {@code aweme_list} payload. */
-    public void ingestHistoryList(JSONArray awemeList) {
-        if (awemeList == null) return;
-        boolean changed = false;
+    public int ingestHistoryList(JSONArray awemeList) {
+        if (awemeList == null) return 0;
+        int added = 0;
         for (int i = 0; i < awemeList.length(); i++) {
             JSONObject item = awemeList.optJSONObject(i);
             if (item == null) continue;
-            String id = item.optString("aweme_id", "");
+            String id = extractAwemeId(item);
             if (id.isEmpty()) continue;
-            if (watchedIds.add(id)) changed = true;
+            if (watchedIds.add(id)) added++;
         }
-        if (changed) {
+        if (added > 0) {
             trimIfNeeded();
             persist();
         }
+        return added;
+    }
+
+    private static String extractAwemeId(JSONObject item) {
+        String id = item.optString("aweme_id", "");
+        if (!id.isEmpty()) return id;
+        id = item.optString("awemeId", "");
+        if (!id.isEmpty()) return id;
+        JSONObject nested = item.optJSONObject("aweme");
+        if (nested == null) nested = item.optJSONObject("aweme_info");
+        if (nested == null) nested = item.optJSONObject("aweme_detail");
+        if (nested != null) {
+            id = nested.optString("aweme_id", "");
+            if (id.isEmpty()) id = nested.optString("awemeId", "");
+        }
+        return id != null ? id : "";
     }
 
     public int size() {

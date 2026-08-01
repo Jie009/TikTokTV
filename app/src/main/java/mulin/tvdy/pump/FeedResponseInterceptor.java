@@ -36,11 +36,11 @@ final class FeedResponseInterceptor {
         if (url.contains("/history/")) {
             return false;
         }
+        // Recommend feeds + creator posts. Never favorites/collections (seen content).
         return url.contains("/tab/feed")
                 || url.contains("/module/feed")
-                || url.contains("/aweme/favorite")
-                || url.contains("/aweme/post")
-                || url.contains("/mix/listcollection");
+                || (url.contains("/aweme/") && url.contains("/feed"))
+                || url.contains("/aweme/post");
     }
 
     @Nullable

@@ -72,6 +72,8 @@ import mulin.tvdy.data.CreatorVideoRepository;
 
 import mulin.tvdy.data.FeedRepository;
 
+import mulin.tvdy.data.FeedVideo;
+
 import mulin.tvdy.data.PageRequester;
 
 import mulin.tvdy.data.WatchedAwemeStore;
@@ -134,6 +136,12 @@ public final class FeedPumpController implements PageRequester {
 
         void onPumpError(String message);
 
+
+
+        /** Watch-history store grew; purge already-queued watched items. */
+        default void onWatchHistoryUpdated() {
+        }
+
     }
 
 
@@ -172,6 +180,9 @@ public final class FeedPumpController implements PageRequester {
 
     private boolean creatorMode = false;
 
+    /** True only when we fell back to loading {@code /user/{sec_uid}} in the WebView. */
+    private boolean creatorNavigatedToProfile = false;
+
     private String activeCreatorSecUid;
 
     private Runnable hookTicker;
@@ -208,7 +219,13 @@ public final class FeedPumpController implements PageRequester {
 
     private int historyPagesFetched = 0;
 
-    private static final int MAX_HISTORY_PAGES = 5;
+    private int historyFetchFailures = 0;
+
+    private String lastHistoryBatchKey = "";
+
+    private static final int MAX_HISTORY_PAGES = 10;
+
+    private static final int MAX_HISTORY_FETCH_FAILURES = 8;
 
 
 
@@ -240,6 +257,12 @@ public final class FeedPumpController implements PageRequester {
 
             WatchedAwemeStore.getInstance().bindSession();
 
+            // Sync history as soon as the pump has a chance to sign — do not
+            // wait for first-frame playback (feed often fills the queue first).
+            pendingHistorySync = true;
+
+            tryStartWatchHistorySync(1_200);
+
         }
 
         injectLoggedInFlag();
@@ -256,6 +279,10 @@ public final class FeedPumpController implements PageRequester {
 
         historyPagesFetched = 0;
 
+        historyFetchFailures = 0;
+
+        lastHistoryBatchKey = "";
+
         pendingHistorySync = false;
 
     }
@@ -266,19 +293,25 @@ public final class FeedPumpController implements PageRequester {
 
         pendingHistorySync = true;
 
-        if (playbackStartedNotified && loggedIn && !historySyncRequested) {
+        tryStartWatchHistorySync(800);
 
-            handler.postDelayed(() -> {
+    }
 
-                if (!loggedIn || historySyncRequested) return;
 
-                syncWatchHistory();
 
-                fetchNextHistoryPage();
+    private void tryStartWatchHistorySync(long delayMs) {
 
-            }, 1_000);
+        if (!loggedIn || historySyncRequested) return;
 
-        }
+        handler.postDelayed(() -> {
+
+            if (!loggedIn || historySyncRequested || webView == null) return;
+
+            syncWatchHistory();
+
+            fetchNextHistoryPage();
+
+        }, Math.max(0, delayMs));
 
     }
 
@@ -396,7 +429,7 @@ public final class FeedPumpController implements PageRequester {
 
     private void nudgePageForFeed(boolean forceInitial) {
 
-        if (webView == null || pageFetchInFlight) return;
+        if (webView == null || pageFetchInFlight || creatorMode) return;
 
         if (awaitingLiteJsonFeed) {
 
@@ -514,17 +547,12 @@ public final class FeedPumpController implements PageRequester {
 
         playbackStartedNotified = true;
 
-        if (!loggedIn || historySyncRequested) return;
+        // Fallback if early login sync never ran (signer not ready yet).
+        if (loggedIn && !historySyncRequested) {
 
-        handler.postDelayed(() -> {
+            tryStartWatchHistorySync(500);
 
-            if (!loggedIn || historySyncRequested) return;
-
-            syncWatchHistory();
-
-            fetchNextHistoryPage();
-
-        }, 3_000);
+        }
 
     }
 
@@ -639,6 +667,10 @@ public final class FeedPumpController implements PageRequester {
         historyCursor = 0;
 
         historyPagesFetched = 0;
+
+        historyFetchFailures = 0;
+
+        lastHistoryBatchKey = "";
 
         pendingHistorySync = false;
 
@@ -793,6 +825,22 @@ public final class FeedPumpController implements PageRequester {
         webView.setWebViewClient(new WebViewClient() {
 
             @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                if (request == null || !request.isForMainFrame()) {
+                    return false;
+                }
+                android.net.Uri uri = request.getUrl();
+                if (uri == null) return false;
+                String path = uri.getPath() != null ? uri.getPath() : "";
+                // Soft SPA pushes may still slip through; hooks pin those.
+                if (loggedIn && !creatorMode && path.contains("/user/self")) {
+                    Log.d(TAG, "blocked pump navigation to user/self");
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
 
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
 
@@ -822,6 +870,12 @@ public final class FeedPumpController implements PageRequester {
 
                 markPageInteractive("页面已加载，等待视频…");
 
+                if (loggedIn && pendingHistorySync && !historySyncRequested) {
+
+                    tryStartWatchHistorySync(400);
+
+                }
+
                 if (loggedIn && repository.bufferSize() == 0 && !feedApiSeen) {
 
                     scrapeEmbeddedFeed();
@@ -844,8 +898,6 @@ public final class FeedPumpController implements PageRequester {
                                     + " bytes=" + (body != null ? body.length() : 0));
                             if (status == 200 && body != null && !body.isEmpty()) {
                                 handleFeedData(url, body);
-                            } else if (isAlternateAwemeListUrl(url)) {
-                                handler.postDelayed(() -> scrapeEmbeddedFeed(), 800);
                             }
                         }));
                 if (mirrored != null) {
@@ -1024,6 +1076,14 @@ public final class FeedPumpController implements PageRequester {
 
     private void handlePageFetchTimeout() {
 
+        if (creatorMode) {
+
+            handleCreatorPageFetchTimeout();
+
+            return;
+
+        }
+
         if (repository.bufferSize() >= PUMP_LOW_WATER_MARK) {
 
             pageFetchInFlight = false;
@@ -1081,6 +1141,52 @@ public final class FeedPumpController implements PageRequester {
         repository.releasePageRequest();
 
         Log.w(TAG, "page feed nudge timed out, will retry when buffer drains");
+
+    }
+
+
+
+    private void handleCreatorPageFetchTimeout() {
+
+        pageFetchInFlight = false;
+
+        creatorRepository.releasePageRequest();
+
+        if (creatorRepository.size() >= 8) {
+
+            pageFetchRetryCount = 0;
+
+            return;
+
+        }
+
+        if (pageFetchRetryCount < MAX_PAGE_FETCH_RETRIES) {
+
+            pageFetchRetryCount++;
+
+            Log.w(TAG, "creator post fetch timeout, retry " + pageFetchRetryCount
+
+                    + "/" + MAX_PAGE_FETCH_RETRIES);
+
+            handler.postDelayed(this::requestCreatorNextPage, PAGE_FETCH_RETRY_DELAY_MS);
+
+            return;
+
+        }
+
+        pageFetchRetryCount = 0;
+
+        if (!creatorNavigatedToProfile && activeCreatorSecUid != null) {
+
+            Log.w(TAG, "creator post fetch timed out, falling back to profile page");
+
+            fallbackLoadCreatorProfilePage(activeCreatorSecUid);
+
+        } else {
+
+            Log.w(TAG, "creator post fetch timed out");
+
+        }
 
     }
 
@@ -1158,24 +1264,14 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-    /** Logged-in pages often skip module/feed but still return playable lists here. */
-    private static boolean isAlternateAwemeListUrl(String url) {
-
-        if (url == null || !url.contains("douyin.com")) return false;
-
-        return url.contains("/aweme/favorite")
-
-                || url.contains("/aweme/post")
-
-                || url.contains("/mix/listcollection");
-
-    }
-
-
-
+    /**
+     * Only real recommend/feed APIs fill the for-you queue. Favorites / posts /
+     * collections are intentionally excluded — they are already-seen content and
+     * used to pollute cold-start playback when the WebView visits profile pages.
+     */
     private static boolean acceptsAwemeListCapture(String url) {
 
-        return isFeedApiUrl(url) || isAlternateAwemeListUrl(url);
+        return isFeedApiUrl(url);
 
     }
 
@@ -1462,12 +1558,6 @@ public final class FeedPumpController implements PageRequester {
 
                 Log.d(TAG, "saw api call: " + url + " (" + note + ")");
 
-                if (isAlternateAwemeListUrl(url) && repository.bufferSize() == 0) {
-
-                    handler.postDelayed(() -> FeedPumpController.this.scrapeEmbeddedFeed(), 800);
-
-                }
-
                 if (pageFetchInFlight) {
 
                     schedulePageFetchTimeout();
@@ -1526,7 +1616,58 @@ public final class FeedPumpController implements PageRequester {
 
                 historyFetchInFlight = false;
 
-                Log.w(TAG, "history fetch failed: " + reason);
+                historyFetchFailures++;
+
+                Log.w(TAG, "history fetch failed: " + reason
+
+                        + " (" + historyFetchFailures + "/" + MAX_HISTORY_FETCH_FAILURES + ")");
+
+                if (!loggedIn || !historySyncRequested) return;
+
+                if (historyFetchFailures >= MAX_HISTORY_FETCH_FAILURES) {
+
+                    historySyncRequested = false;
+
+                    Log.w(TAG, "history sync gave up after repeated failures");
+
+                    return;
+
+                }
+
+                // Signer often appears a beat after page load — retry soon.
+                handler.postDelayed(() -> {
+
+                    if (!loggedIn || !historySyncRequested || historyFetchInFlight) return;
+
+                    fetchNextHistoryPage();
+
+                }, 1_500);
+
+            });
+
+        }
+
+
+
+        @JavascriptInterface
+
+        public void onCreatorPostFetchFailed(final String reason) {
+
+            handler.post(() -> {
+
+                pageFetchInFlight = false;
+
+                creatorRepository.releasePageRequest();
+
+                Log.w(TAG, "creator post fetch failed: " + reason);
+
+                if (!creatorMode || activeCreatorSecUid == null) return;
+
+                if (!creatorNavigatedToProfile) {
+
+                    fallbackLoadCreatorProfilePage(activeCreatorSecUid);
+
+                }
 
             });
 
@@ -1644,7 +1785,7 @@ public final class FeedPumpController implements PageRequester {
 
         if (json == null || json.isEmpty()) return;
 
-        if (isFeedApiUrl(url) || isAlternateAwemeListUrl(url)) {
+        if (isFeedApiUrl(url)) {
             feedApiSeen = true;
         }
 
@@ -1678,16 +1819,9 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-            if (!acceptsAwemeListCapture(url)) {
-
-                return;
-
-            }
-
-
-
             JSONArray list = extractAwemeList(root);
 
+            // Creator profile posts are not for-you feed; handle before the feed gate.
             if (creatorMode && isCreatorPostUrl(url)) {
 
                 handleCreatorPostData(url, root, list);
@@ -1696,9 +1830,50 @@ public final class FeedPumpController implements PageRequester {
 
             }
 
+            if (!acceptsAwemeListCapture(url)) {
+
+                return;
+
+            }
+
             if (creatorMode) {
 
                 return;
+
+            }
+
+            // History/favorite bodies used to be sticky-attributed to module/feed.
+            // While history sync is running, drop all-watched "feed" captures so they
+            // cannot rewrite for-you pagination cursors.
+            if (historyFetchInFlight && list != null && list.length() >= 5) {
+
+                int watchedMarks = 0;
+
+                for (int i = 0; i < list.length(); i++) {
+
+                    JSONObject item = list.optJSONObject(i);
+
+                    if (item == null) continue;
+
+                    String id = item.optString("aweme_id", "");
+
+                    if (FeedVideo.isMarkedWatchedByServer(item)
+
+                            || WatchedAwemeStore.getInstance().isWatched(id)) {
+
+                        watchedMarks++;
+
+                    }
+
+                }
+
+                if (watchedMarks >= list.length()) {
+
+                    Log.d(TAG, "ignoring all-watched feed capture during history fetch");
+
+                    return;
+
+                }
 
             }
 
@@ -1728,15 +1903,7 @@ public final class FeedPumpController implements PageRequester {
 
 
 
-            if (isFeedApiUrl(url)) {
-
-                paginationState.updateFromCapture(url, root);
-
-            } else {
-
-                Log.d(TAG, "logged-in aweme_list from " + url + " count=" + list.length());
-
-            }
+            paginationState.updateFromCapture(url, root);
 
 
 
@@ -1766,13 +1933,45 @@ public final class FeedPumpController implements PageRequester {
 
         JSONArray list = root.optJSONArray("aweme_list");
 
+        if (list == null) list = root.optJSONArray("awemeList");
+
+
+
+        String batchKey = historyBatchKey(root, list);
+
+        if (!batchKey.isEmpty() && batchKey.equals(lastHistoryBatchKey)) {
+
+            Log.d(TAG, "history sync: duplicate page ignored");
+
+            return;
+
+        }
+
+        if (!batchKey.isEmpty()) lastHistoryBatchKey = batchKey;
+
+
+
+        historyFetchFailures = 0;
+
+        int added = 0;
+
         if (list != null && list.length() > 0) {
 
-            WatchedAwemeStore.getInstance().ingestHistoryList(list);
+            added = WatchedAwemeStore.getInstance().ingestHistoryList(list);
 
-            Log.d(TAG, "history sync: +" + list.length()
+            Log.d(TAG, "history sync: +" + added + "/" + list.length()
 
                     + " ids, storeSize=" + WatchedAwemeStore.getInstance().size());
+
+            if (added > 0) {
+
+                int purged = repository.purgeWatchedFromQueue();
+
+                if (listener != null) listener.onWatchHistoryUpdated();
+
+                Log.d(TAG, "history purge: queueRemoved=" + purged);
+
+            }
 
         }
 
@@ -1800,13 +1999,56 @@ public final class FeedPumpController implements PageRequester {
 
         historySyncRequested = false;
 
-        Log.d(TAG, "history sync complete, pages=" + historyPagesFetched);
+        Log.d(TAG, "history sync complete, pages=" + historyPagesFetched
+
+                + " storeSize=" + WatchedAwemeStore.getInstance().size());
 
     }
 
 
 
-    /** Switches the hidden pump to a creator profile and captures {@code /aweme/post}. */
+    private static String historyBatchKey(JSONObject root, JSONArray list) {
+
+        long cursor = root.optLong("max_cursor", 0);
+
+        int len = list != null ? list.length() : 0;
+
+        String first = "";
+
+        if (list != null && len > 0) {
+
+            JSONObject item = list.optJSONObject(0);
+
+            if (item != null) {
+
+                first = item.optString("aweme_id", "");
+
+                if (first.isEmpty()) {
+
+                    JSONObject nested = item.optJSONObject("aweme");
+
+                    if (nested == null) nested = item.optJSONObject("aweme_info");
+
+                    if (nested != null) first = nested.optString("aweme_id", "");
+
+                }
+
+            }
+
+        }
+
+        return cursor + ":" + len + ":" + first;
+
+    }
+
+
+
+    /**
+     * Captures creator works via signed {@code /aweme/post} on the current pump
+     * page. Avoids loading the full user SPA (profile/other + hydration) first.
+     * Falls back to navigating {@code /user/{sec_uid}} if signing is unavailable
+     * (e.g. pump wandered to {@code /user/self}).
+     */
     public void loadCreatorProfile(String secUid) {
 
         if (webView == null || secUid == null || secUid.isEmpty()) return;
@@ -1815,13 +2057,58 @@ public final class FeedPumpController implements PageRequester {
 
         activeCreatorSecUid = secUid;
 
+        creatorNavigatedToProfile = false;
+
         creatorPaginationState.reset();
 
         pageFetchInFlight = false;
 
-        notifyStatus("正在打开博主主页…");
+        pageFetchRetryCount = 0;
 
-        webView.loadUrl(DouyinConstants.creatorProfileUrl(secUid));
+        notifyStatus("正在加载博主作品…");
+
+        // Require a real sign (a_bogus/X-Bogus), not just an acrawler object.
+        webView.evaluateJavascript(
+                "window.__tvdyCreatorMode=true;"
+                        + FeedHookScripts.SIGN_HELPERS
+                        + FeedHookScripts.URL_HELPERS
+                        + "(function(){try{"
+                        + "var p=location.pathname||'';"
+                        + "var can=typeof tvdyCanSign==='function'&&tvdyCanSign();"
+                        + "var ac=typeof tvdyFindAcrawler==='function'&&!!tvdyFindAcrawler();"
+                        + "var onFeed=p==='/'||p.indexOf('jingxuan')>=0||p.indexOf('recommend')>=0;"
+                        + "var onSelf=p.indexOf('/user/self')>=0;"
+                        + "return JSON.stringify({can:!!can,has:!!ac,onFeed:onFeed,onSelf:onSelf,p:p});"
+                        + "}catch(e){return '{}';}})();",
+                value -> {
+                    if (!creatorMode || activeCreatorSecUid == null) return;
+                    boolean canSign = false;
+                    boolean hasSigner = false;
+                    boolean onFeed = false;
+                    boolean onSelf = false;
+                    try {
+                        String raw = value;
+                        if (raw != null && raw.length() >= 2 && raw.startsWith("\"") && raw.endsWith("\"")) {
+                            raw = new JSONObject("{\"v\":" + value + "}").getString("v");
+                        }
+                        JSONObject o = new JSONObject(raw != null ? raw : "{}");
+                        canSign = o.optBoolean("can", false);
+                        hasSigner = o.optBoolean("has", false);
+                        onFeed = o.optBoolean("onFeed", false);
+                        onSelf = o.optBoolean("onSelf", false);
+                        Log.d(TAG, "creator probe path=" + o.optString("p", "")
+                                + " canSign=" + canSign + " hasSigner=" + hasSigner
+                                + " onFeed=" + onFeed + " onSelf=" + onSelf);
+                    } catch (Exception e) {
+                        Log.d(TAG, "creator probe parse failed: " + value);
+                    }
+                    if (canSign) {
+                        requestCreatorNextPage();
+                    } else {
+                        Log.d(TAG, "creator: sign unavailable, load profile SPA");
+                        fallbackLoadCreatorProfilePage(activeCreatorSecUid);
+                    }
+                });
 
     }
 
@@ -1832,15 +2119,38 @@ public final class FeedPumpController implements PageRequester {
 
         if (webView == null) return;
 
+        boolean wasOnProfile = creatorNavigatedToProfile;
+
         creatorMode = false;
 
         activeCreatorSecUid = null;
+
+        creatorNavigatedToProfile = false;
 
         creatorPaginationState.reset();
 
         pageFetchInFlight = false;
 
-        webView.loadUrl(DouyinConstants.pumpStartUrl(loggedIn));
+        pageFetchRetryCount = 0;
+
+        webView.evaluateJavascript("window.__tvdyCreatorMode=false;", null);
+
+        // Drop any watched items that snuck into the for-you buffer while the
+        // WebView visited profile/favorite APIs during creator browse.
+        int purged = repository.purgeWatchedFromQueue();
+
+        if (purged > 0 && listener != null) {
+
+            listener.onWatchHistoryUpdated();
+
+        }
+
+        // Only reload feed if we left jingxuan/home for the profile SPA.
+        if (wasOnProfile) {
+
+            webView.loadUrl(DouyinConstants.pumpStartUrl(loggedIn));
+
+        }
 
     }
 
@@ -1864,15 +2174,66 @@ public final class FeedPumpController implements PageRequester {
 
     private void requestCreatorNextPage() {
 
-        if (webView == null || !creatorMode || pageFetchInFlight) return;
+        if (webView == null || !creatorMode) {
+            creatorRepository.releasePageRequest();
+            return;
+        }
+
+        if (activeCreatorSecUid == null || activeCreatorSecUid.isEmpty()) {
+            creatorRepository.releasePageRequest();
+            return;
+        }
+
+        // Already fetching; repo in-flight flag will clear when the current page completes.
+        if (pageFetchInFlight) return;
 
         pageFetchInFlight = true;
 
+        apiCallsSeenAtNudge = apiCallsSeen;
+
+        pageFetchTimeoutExtensions = 0;
+
         schedulePageFetchTimeout();
 
-        Log.d(TAG, "nudge creator profile pagination");
+        long cursor = creatorPaginationState.getMaxCursor();
 
-        webView.evaluateJavascript(FeedHookScripts.TRIGGER_PAGE_FEED, null);
+        if (creatorNavigatedToProfile) {
+
+            Log.d(TAG, "nudge creator profile pagination cursor=" + cursor);
+
+            webView.evaluateJavascript(FeedHookScripts.TRIGGER_PAGE_FEED, null);
+
+            return;
+
+        }
+
+        Log.d(TAG, "fetch creator post api cursor=" + cursor);
+
+        webView.evaluateJavascript(
+
+                FeedHookScripts.buildFetchCreatorPostScript(activeCreatorSecUid, cursor),
+
+                null);
+
+    }
+
+
+
+    private void fallbackLoadCreatorProfilePage(String secUid) {
+
+        if (webView == null || secUid == null || secUid.isEmpty()) return;
+
+        creatorNavigatedToProfile = true;
+
+        pageFetchInFlight = false;
+
+        pageFetchRetryCount = 0;
+
+        notifyStatus("正在打开博主主页…");
+
+        Log.d(TAG, "fallback load creator profile page");
+
+        webView.loadUrl(DouyinConstants.creatorProfileUrl(secUid));
 
     }
 
@@ -1883,6 +2244,17 @@ public final class FeedPumpController implements PageRequester {
         if (!isCreatorPostForActiveUser(url)) {
 
             Log.d(TAG, "ignoring creator post for inactive user from " + url);
+
+            onFeedCaptureComplete();
+
+            return;
+
+        }
+
+        // Reject mis-attributed bodies (e.g. favorites JSON.parse under last post URL).
+        if (list != null && list.length() > 0 && !listMatchesActiveCreator(list)) {
+
+            Log.d(TAG, "ignoring post body author mismatch from " + url);
 
             onFeedCaptureComplete();
 
@@ -1910,6 +2282,23 @@ public final class FeedPumpController implements PageRequester {
 
         }
 
+    }
+
+    private boolean listMatchesActiveCreator(JSONArray list) {
+        if (activeCreatorSecUid == null || activeCreatorSecUid.isEmpty() || list == null) {
+            return false;
+        }
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject item = list.optJSONObject(i);
+            if (item == null) continue;
+            JSONObject author = item.optJSONObject("author");
+            if (author == null) continue;
+            String sec = author.optString("sec_uid", author.optString("sec_user_id", ""));
+            if (activeCreatorSecUid.equals(sec)) {
+                return true;
+            }
+        }
+        return false;
     }
 
 

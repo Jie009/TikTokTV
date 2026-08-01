@@ -410,6 +410,22 @@
 
         </LinearLayout>
 
+        <!-- DEBUG-only: dump / force split-stream playback for POC validation. -->
+        <LinearLayout
+            android:id="@+id/featureMenuSplitPoc"
+            style="@style/FeatureMenuRow"
+            android:visibility="gone">
+
+            <ImageView
+                style="@style/FeatureMenuIcon"
+                android:src="@drawable/ic_creator" />
+
+            <TextView
+                style="@style/FeatureMenuLabel"
+                android:text="分轨 POC" />
+
+        </LinearLayout>
+
         <LinearLayout
             android:id="@+id/featureMenuLogout"
             style="@style/FeatureMenuRow"
