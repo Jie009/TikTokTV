@@ -20,9 +20,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class CreatorVideoRepository {
 
     private static final String TAG = "CreatorVideoRepo";
-    private static final int LOW_WATER_MARK = 8;
     private static final int MAX_SEEN_IDS = 2000;
-    private static final long PAGE_REQUEST_COOLDOWN_MS = 2_000;
+    private static final long PAGE_REQUEST_COOLDOWN_MS = 1_200;
 
     private static CreatorVideoRepository instance;
 
@@ -103,7 +102,6 @@ public final class CreatorVideoRepository {
     public void addAwemeList(JSONArray awemeList) {
         if (awemeList == null) {
             pageRequestInFlight = false;
-            maybeRequestMore();
             return;
         }
 
@@ -130,7 +128,7 @@ public final class CreatorVideoRepository {
         if (added > 0) {
             notifyChanged();
         }
-        maybeRequestMore();
+        // Grid is append-only; next pages are requested when the user scrolls near the end.
     }
 
     public int size() {
@@ -169,8 +167,15 @@ public final class CreatorVideoRepository {
         pageRequestInFlight = false;
     }
 
+    /** Request the next /aweme/post page (e.g. grid scrolled near the end). */
     public void kickstartPaging() {
-        maybeRequestMore();
+        if (pageRequester == null || pageRequestInFlight || !hasMore) return;
+        long now = System.currentTimeMillis();
+        if (now - lastPageRequestAt < PAGE_REQUEST_COOLDOWN_MS) return;
+        pageRequestInFlight = true;
+        lastPageRequestAt = now;
+        Log.d(TAG, "request next page total=" + videos.size() + " hasMore=" + hasMore);
+        pageRequester.requestNextPage();
     }
 
     private boolean enqueue(FeedVideo video) {
@@ -179,16 +184,6 @@ public final class CreatorVideoRepository {
         trimSeenIdsIfNeeded();
         videos.add(video);
         return true;
-    }
-
-    private void maybeRequestMore() {
-        if (pageRequester == null || pageRequestInFlight || !hasMore) return;
-        if (videos.size() >= LOW_WATER_MARK) return;
-        long now = System.currentTimeMillis();
-        if (now - lastPageRequestAt < PAGE_REQUEST_COOLDOWN_MS) return;
-        pageRequestInFlight = true;
-        lastPageRequestAt = now;
-        pageRequester.requestNextPage();
     }
 
     private void trimSeenIdsIfNeeded() {

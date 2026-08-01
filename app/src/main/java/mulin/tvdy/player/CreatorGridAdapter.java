@@ -21,11 +21,20 @@ final class CreatorGridAdapter extends RecyclerView.Adapter<CreatorGridAdapter.H
         void onVideoSelected(int index);
     }
 
+    interface OnBindNearEndListener {
+        void onBindNearEnd(int position);
+    }
+
     private final List<FeedVideo> videos = new ArrayList<>();
     private OnVideoSelectedListener listener;
+    private OnBindNearEndListener nearEndListener;
 
     void setOnVideoSelectedListener(OnVideoSelectedListener listener) {
         this.listener = listener;
+    }
+
+    void setOnBindNearEndListener(OnBindNearEndListener listener) {
+        this.nearEndListener = listener;
     }
 
     void setVideos(List<FeedVideo> items) {
@@ -59,6 +68,9 @@ final class CreatorGridAdapter extends RecyclerView.Adapter<CreatorGridAdapter.H
                 listener.onVideoSelected(pos);
             }
         });
+        if (nearEndListener != null) {
+            nearEndListener.onBindNearEnd(position);
+        }
     }
 
     @Override

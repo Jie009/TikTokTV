@@ -44,6 +44,9 @@ import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.exoplayer.source.MediaSource;
+import androidx.media3.exoplayer.source.MergingMediaSource;
+import androidx.media3.exoplayer.source.ProgressiveMediaSource;
 import androidx.media3.ui.PlayerView;
 
 import java.util.ArrayList;
@@ -55,6 +58,7 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import mulin.tvdy.BuildConfig;
 import mulin.tvdy.DeviceUtils;
 import mulin.tvdy.DouyinConstants;
 import mulin.tvdy.R;
@@ -104,9 +108,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     private static final String TAG = "PlayerActivity";
-    private static final int PRELOAD_AHEAD = 5;
-    /** Buffer the full upcoming playlist item(s) ahead of the playhead. */
-    private static final long PRELOAD_FULL_US = 600_000_000L;
+    /** Upcoming items to buffer; kept small so preload does not starve the active stream. */
+    private static final int PRELOAD_AHEAD = 2;
+    /** Buffer target for the next playlist item while playing (µs). */
+    private static final long PRELOAD_FULL_US = 90_000_000L;
+    /** While rebuffering, stop ahead-preload so bandwidth goes to the current item. */
+    private static final long PRELOAD_REBUFFER_US = 0L;
     /** Min media duration ExoPlayer tries to keep buffered while playing. */
     private static final int MIN_BUFFER_MS = 30_000;
     /** Max media duration ExoPlayer will buffer ahead of the playhead. */
@@ -177,8 +184,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private final Map<String, Long> resumePositions = new HashMap<>();
     /** Next index into {@link FeedVideo#playUrlCandidates} to try after CDN 403. */
     private final Map<String, Integer> playUrlCandidateIndex = new HashMap<>();
+    /** Next index into {@link FeedVideo#splitCandidates}; -1 means fall back to muxed. */
+    private final Map<String, Integer> splitCandidateIndex = new HashMap<>();
 
     private FeedPumpController pump;
+    private DouyinHttpDataSource.Factory httpDataSourceFactory;
+    private ProgressiveMediaSource.Factory progressiveSourceFactory;
     private ExoPlayer player;
     private View splashOverlay;
     private LottieAnimationView splashAnimation;
@@ -274,8 +285,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private CreatorGridAdapter creatorGridAdapter;
     private FeedVideo feedAnchorVideo;
     private long feedAnchorPositionMs;
-    /** Ignores stale {@link Player#STATE_ENDED} while rebuilding feed anchor playlist. */
+    /** Ignores stale end-of-item events while rebuilding feed anchor playlist. */
     private long ignorePlaybackEndedUntilMs = 0;
+    /** True while a natural-end auto-advance is already queued (END_OF_MEDIA_ITEM + STATE_ENDED). */
+    private boolean playbackEndedAdvancePending = false;
 
     private final Runnable hideControlsRunnable = this::hideControls;
     private final Runnable startupTimeoutRunnable = this::onStartupTimeout;
@@ -382,6 +395,11 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 updateSplashStatus(message);
                 Log.w(TAG, "pump error: " + message);
             }
+
+            @Override
+            public void onWatchHistoryUpdated() {
+                purgeWatchedFromUpcomingPlaylist();
+            }
         });
         if (hasSavedSession()) {
             pump.setLoggedIn(true);
@@ -390,7 +408,8 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         pump.start((ViewGroup) findViewById(R.id.playerRoot));
 
         // Session cookies are injected per-request in DouyinHttpDataSource.
-        DouyinHttpDataSource.Factory httpDataSourceFactory = new DouyinHttpDataSource.Factory();
+        httpDataSourceFactory = new DouyinHttpDataSource.Factory();
+        progressiveSourceFactory = new ProgressiveMediaSource.Factory(httpDataSourceFactory);
 
         player = new ExoPlayer.Builder(this, buildRenderersFactory())
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(httpDataSourceFactory))
@@ -425,23 +444,39 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                 if (playbackState == Player.STATE_READY && !slideAnimating) {
                     refillPlaylist();
                 }
+                if (playbackState == Player.STATE_BUFFERING && player.getPlayWhenReady()) {
+                    player.setPreloadConfiguration(new PreloadConfiguration(PRELOAD_REBUFFER_US));
+                } else if (playbackState == Player.STATE_READY && player.isPlaying()) {
+                    adjustPreloadForPlay();
+                }
                 if (playbackState == Player.STATE_ENDED) {
-                    if (System.currentTimeMillis() < ignorePlaybackEndedUntilMs) {
-                        updatePlaybackChrome();
-                        return;
-                    }
+                    // Fires for the final playlist item. Mid-playlist ends are
+                    // delivered via onPlayWhenReadyChanged(END_OF_MEDIA_ITEM)
+                    // instead — pauseAtEndOfMediaItems keeps those in READY.
                     handlePlaybackEnded();
                     return;
-                } else {
-                    updatePlaybackChrome();
-                    updateProgressUi();
                 }
+                updatePlaybackChrome();
+                updateProgressUi();
+            }
+
+            @Override
+            public void onPlayWhenReadyChanged(boolean playWhenReady, int reason) {
+                // With pauseAtEndOfMediaItems, finishing a non-final playlist
+                // item only clears playWhenReady — STATE_ENDED is NOT set.
+                // That is the normal "video finished" signal for auto-next.
+                if (!playWhenReady
+                        && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM) {
+                    handlePlaybackEnded();
+                    return;
+                }
+                updatePlaybackChrome();
             }
 
             @Override
             public void onMediaItemTransition(MediaItem mediaItem, int reason) {
-                // Natural end-of-video is handled via STATE_ENDED +
-                // playNext() so we can run the dual-page slide animation.
+                // Natural end-of-video is handled via END_OF_MEDIA_ITEM /
+                // STATE_ENDED + playNext() so we can run the dual-page slide.
                 // Seek-driven transitions are handled in advance().
             }
 
@@ -468,6 +503,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             @Override
             public void onPlayerError(@NonNull PlaybackException error) {
                 Log.w(TAG, "playback error for " + (current != null ? current.awemeId : "?")
+                        + " mode=" + playbackModeLabel(current)
                         + " url=" + playbackUrlFor(current)
                         + " errorCode=" + error.errorCode, error);
                 if (retryCurrentWithNextCandidate()) return;
@@ -1016,7 +1052,6 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private void resumeFromUserPause() {
         autoStartWhenReady = true;
         if (player == null) return;
-        player.setPlayWhenReady(true);
         adjustPreloadForPlay();
         if (pendingAdvance > 0 && playlistIndex + 1 < playlist.size()) {
             pendingAdvance = 0;
@@ -1024,8 +1059,14 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         } else if (pendingAdvance < 0 && playlistIndex > 0) {
             pendingAdvance = 0;
             advance(-1);
+        } else if (isPausedAtEndOfItem()) {
+            // Start after a natural finish should go to the next video, not
+            // restart/resume the ended frame via ExoPlayer's bare play().
+            pendingAdvance = 0;
+            playNext();
         } else {
             pendingAdvance = 0;
+            player.setPlayWhenReady(true);
             player.play();
         }
         updatePlaybackChrome();
@@ -1128,6 +1169,8 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             openCreatorGrid();
         } else if (id == R.id.featureMenuLogout) {
             logout();
+        } else if (id == R.id.featureMenuSplitPoc) {
+            runSplitStreamPoc();
         } else {
             Toast.makeText(this, "功能开发中", Toast.LENGTH_SHORT).show();
         }
@@ -1135,6 +1178,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private void rebuildMenuItems() {
         menuItems.clear();
+        View splitPoc = findViewById(R.id.featureMenuSplitPoc);
         if (loggedIn) {
             featureMenuAccountHeader.setVisibility(View.VISIBLE);
             featureMenuAccountDivider.setVisibility(View.VISIBLE);
@@ -1144,6 +1188,12 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             menuItems.add(findViewById(R.id.featureMenuLike));
             menuItems.add(findViewById(R.id.featureMenuFollow));
             menuItems.add(findViewById(R.id.featureMenuComments));
+            if (BuildConfig.DEBUG && splitPoc != null) {
+                splitPoc.setVisibility(View.VISIBLE);
+                menuItems.add(splitPoc);
+            } else if (splitPoc != null) {
+                splitPoc.setVisibility(View.GONE);
+            }
             menuItems.add(featureMenuLogout);
         } else {
             featureMenuAccountHeader.setVisibility(View.GONE);
@@ -1155,9 +1205,54 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             menuItems.add(findViewById(R.id.featureMenuLike));
             menuItems.add(findViewById(R.id.featureMenuFollow));
             menuItems.add(findViewById(R.id.featureMenuComments));
+            if (BuildConfig.DEBUG && splitPoc != null) {
+                splitPoc.setVisibility(View.VISIBLE);
+                menuItems.add(splitPoc);
+            } else if (splitPoc != null) {
+                splitPoc.setVisibility(View.GONE);
+            }
         }
         if (menuSelectedIndex >= menuItems.size()) {
             menuSelectedIndex = 0;
+        }
+    }
+
+    /**
+     * DEBUG POC: log HEVC capability + current item's split/muxed URLs, then
+     * force-reload the current item through {@link #mediaSourceFor}.
+     */
+    private void runSplitStreamPoc() {
+        boolean hevc = HevcCapability.isSupported();
+        if (current == null) {
+            Toast.makeText(this, "无当前视频；HEVC=" + hevc, Toast.LENGTH_LONG).show();
+            Log.i(TAG, "split POC: no current video hevc=" + hevc);
+            return;
+        }
+        Log.i(TAG, "split POC awemeId=" + current.awemeId
+                + " hevcDevice=" + hevc
+                + " splits=" + current.splitCandidates.size()
+                + " muxed=" + current.playUrlCandidates.size()
+                + " selected=" + FeedVideo.shortUrl(playbackUrlFor(current)));
+        for (int i = 0; i < current.splitCandidates.size(); i++) {
+            Log.i(TAG, "split POC candidate[" + i + "]=" + current.splitCandidates.get(i));
+        }
+        for (int i = 0; i < Math.min(3, current.playUrlCandidates.size()); i++) {
+            Log.i(TAG, "split POC muxed[" + i + "]="
+                    + FeedVideo.shortUrl(current.playUrlCandidates.get(i)));
+        }
+        splitCandidateIndex.remove(current.awemeId);
+        playUrlCandidateIndex.put(current.awemeId, 0);
+        if (current.hasSplitStream()) {
+            Toast.makeText(this,
+                    "分轨×" + current.splitCandidates.size() + " HEVC=" + hevc + " → 重载",
+                    Toast.LENGTH_LONG).show();
+        } else {
+            Toast.makeText(this,
+                    "feed无分轨URL，走低码率muxed；HEVC=" + hevc,
+                    Toast.LENGTH_LONG).show();
+        }
+        if (player != null && playlistIndex >= 0) {
+            replaceCurrentSource();
         }
     }
 
@@ -1326,7 +1421,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
                     return;
                 }
                 playlist.add(next);
-                player.addMediaItem(mediaItemFor(next));
+                enqueueVideo(next);
                 SimpleImageLoader.preload(next.coverUrl);
             }
         }
@@ -1339,20 +1434,39 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     /** Runs the slide transition after a video finishes naturally. */
     private void handlePlaybackEnded() {
-        if (slideAnimating) {
-            queuedAdvanceDuringSlide = 1;
+        if (System.currentTimeMillis() < ignorePlaybackEndedUntilMs) {
             updatePlaybackChrome();
             return;
         }
+        // Last playlist item fires END_OF_MEDIA_ITEM then STATE_ENDED; keep one advance.
+        if (playbackEndedAdvancePending || slideAnimating) {
+            if (slideAnimating) queuedAdvanceDuringSlide = 1;
+            updatePlaybackChrome();
+            return;
+        }
+        playbackEndedAdvancePending = true;
         refillPlaylist();
-        handler.post(this::playNext);
+        handler.post(() -> {
+            playbackEndedAdvancePending = false;
+            playNext();
+        });
+    }
+
+    /** True when pauseAtEndOfMediaItems (or STATE_ENDED) left us frozen on the last frame. */
+    private boolean isPausedAtEndOfItem() {
+        if (player == null) return false;
+        if (player.getPlaybackState() == Player.STATE_ENDED) return true;
+        if (player.getPlayWhenReady()) return false;
+        long duration = player.getDuration();
+        long position = player.getCurrentPosition();
+        return duration != C.TIME_UNSET && duration > 0 && position >= duration - 500;
     }
 
     /** Keeps ExoPlayer's internal queue aligned with {@link #playlist}. */
     private void ensurePlayerQueueSynced() {
         if (player == null) return;
         for (int i = player.getMediaItemCount(); i < playlist.size(); i++) {
-            player.addMediaItem(mediaItemFor(playlist.get(i)));
+            enqueueVideo(playlist.get(i));
         }
     }
 
@@ -1362,43 +1476,148 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         advance(-1);
     }
 
-    private MediaItem mediaItemFor(FeedVideo video) {
+    private void enqueueVideo(FeedVideo video) {
+        if (player == null || video == null) return;
+        player.addMediaSource(mediaSourceFor(video));
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private MediaSource mediaSourceFor(FeedVideo video) {
+        registerPlaybackUrls(video);
+        FeedVideo.SplitPlayUrl split = selectedSplit(video);
+        if (split != null) {
+            Log.i(TAG, "split play awemeId=" + video.awemeId
+                    + " br=" + split.videoBrKbps + " hevc=" + split.hevc
+                    + " v=" + FeedVideo.shortUrl(split.videoUrl)
+                    + " a=" + FeedVideo.shortUrl(split.audioUrl));
+            MediaItem videoItem = MediaItem.fromUri(split.videoUrl)
+                    .buildUpon()
+                    .setMediaId(video.awemeId)
+                    .build();
+            MediaItem audioItem = MediaItem.fromUri(split.audioUrl)
+                    .buildUpon()
+                    .setMediaId(video.awemeId + ":audio")
+                    .build();
+            return new MergingMediaSource(
+                    progressiveSourceFactory.createMediaSource(videoItem),
+                    progressiveSourceFactory.createMediaSource(audioItem));
+        }
+        String url = playbackUrlFor(video);
+        Log.i(TAG, "muxed play awemeId=" + video.awemeId + " url=" + FeedVideo.shortUrl(url));
+        return progressiveSourceFactory.createMediaSource(
+                MediaItem.fromUri(url).buildUpon().setMediaId(video.awemeId).build());
+    }
+
+    private void registerPlaybackUrls(FeedVideo video) {
+        if (video == null) return;
         for (String url : video.playUrlCandidates) {
             DouyinPlaybackRegistry.register(url, video.awemeId);
         }
-        return MediaItem.fromUri(playbackUrlFor(video))
-                .buildUpon()
-                .setMediaId(video.awemeId)
-                .build();
+        if (video.splitCandidates != null) {
+            for (FeedVideo.SplitPlayUrl split : video.splitCandidates) {
+                DouyinPlaybackRegistry.register(split.videoUrl, video.awemeId);
+                DouyinPlaybackRegistry.register(split.audioUrl, video.awemeId);
+            }
+        }
+    }
+
+    /**
+     * Picks a browser-style split pair when available. HEVC (hvc1) pairs require
+     * device support; otherwise we fall through to muxed progressive MP4.
+     */
+    private FeedVideo.SplitPlayUrl selectedSplit(FeedVideo video) {
+        if (video == null || !video.hasSplitStream()) return null;
+        Integer forced = splitCandidateIndex.get(video.awemeId);
+        if (forced != null && forced < 0) return null; // explicitly fell back to muxed
+        int start = forced != null ? forced : 0;
+        boolean hevcOk = HevcCapability.isSupported();
+        // Prefer AVC pairs; only take HEVC when no H.264 split remains (or forced).
+        FeedVideo.SplitPlayUrl hevcFallback = null;
+        for (int i = start; i < video.splitCandidates.size(); i++) {
+            FeedVideo.SplitPlayUrl split = video.splitCandidates.get(i);
+            if (split.hevc) {
+                if (hevcOk && hevcFallback == null) hevcFallback = split;
+                continue;
+            }
+            if (forced == null) splitCandidateIndex.put(video.awemeId, i);
+            return split;
+        }
+        if (forced != null) {
+            for (int i = start; i < video.splitCandidates.size(); i++) {
+                FeedVideo.SplitPlayUrl split = video.splitCandidates.get(i);
+                if (split.hevc && !hevcOk) continue;
+                return split;
+            }
+            return null;
+        }
+        if (hevcFallback != null) {
+            int idx = video.splitCandidates.indexOf(hevcFallback);
+            if (idx >= 0) splitCandidateIndex.put(video.awemeId, idx);
+            return hevcFallback;
+        }
+        return null;
     }
 
     private String playbackUrlFor(FeedVideo video) {
         if (video == null) return "";
+        FeedVideo.SplitPlayUrl split = selectedSplit(video);
+        if (split != null) return split.videoUrl;
         int idx = playUrlCandidateIndex.getOrDefault(video.awemeId, 0);
         if (idx >= 0 && idx < video.playUrlCandidates.size()) {
             return video.playUrlCandidates.get(idx);
         }
-        return video.playUrl;
+        return video.playUrl != null ? video.playUrl : "";
     }
 
-    /** Tries the next CDN mirror when the current one returns HTTP 403. */
+    private static String playbackModeLabel(FeedVideo video) {
+        if (video == null) return "?";
+        return video.hasSplitStream() ? "split" : "muxed";
+    }
+
+    /** Tries the next split pair, then muxed CDN mirrors, on playback failure. */
     private boolean retryCurrentWithNextCandidate() {
         if (current == null || player == null || playlistIndex < 0) return false;
+
+        int splitIdx = splitCandidateIndex.getOrDefault(current.awemeId, 0);
+        if (current.hasSplitStream() && splitIdx >= 0) {
+            boolean hevcOk = HevcCapability.isSupported();
+            for (int i = splitIdx + 1; i < current.splitCandidates.size(); i++) {
+                FeedVideo.SplitPlayUrl next = current.splitCandidates.get(i);
+                if (next.hevc && !hevcOk) continue;
+                splitCandidateIndex.put(current.awemeId, i);
+                Log.w(TAG, "retry split awemeId=" + current.awemeId + " candidate=" + i
+                        + "/" + current.splitCandidates.size() + " br=" + next.videoBrKbps);
+                replaceCurrentSource();
+                return true;
+            }
+            // Exhausted splits → muxed fallback.
+            splitCandidateIndex.put(current.awemeId, -1);
+            if (!current.playUrlCandidates.isEmpty()) {
+                playUrlCandidateIndex.put(current.awemeId, 0);
+                Log.w(TAG, "retry fallback muxed awemeId=" + current.awemeId);
+                replaceCurrentSource();
+                return true;
+            }
+        }
+
         int nextIdx = playUrlCandidateIndex.getOrDefault(current.awemeId, 0) + 1;
         if (nextIdx >= current.playUrlCandidates.size()) return false;
         playUrlCandidateIndex.put(current.awemeId, nextIdx);
         String altUrl = current.playUrlCandidates.get(nextIdx);
         DouyinPlaybackRegistry.register(altUrl, current.awemeId);
-        Log.w(TAG, "retry awemeId=" + current.awemeId + " candidate=" + nextIdx
+        Log.w(TAG, "retry muxed awemeId=" + current.awemeId + " candidate=" + nextIdx
                 + "/" + current.playUrlCandidates.size() + " url=" + altUrl);
-        player.replaceMediaItem(playlistIndex, MediaItem.fromUri(altUrl)
-                .buildUpon()
-                .setMediaId(current.awemeId)
-                .build());
+        replaceCurrentSource();
+        return true;
+    }
+
+    private void replaceCurrentSource() {
+        if (player == null || current == null || playlistIndex < 0) return;
+        player.removeMediaItem(playlistIndex);
+        player.addMediaSource(playlistIndex, mediaSourceFor(current));
         player.seekTo(playlistIndex, 0);
         player.prepare();
         player.setPlayWhenReady(true);
-        return true;
     }
 
     /**
@@ -1485,8 +1704,10 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             return;
         }
         ensurePlayerQueueSynced();
-        if (direction > 0 && player.getPlaybackState() == Player.STATE_ENDED) {
-            // seekToNextMediaItem() is unreliable from ENDED; jump explicitly instead.
+        // From a natural finish (ENDED, or READY+paused at the last frame via
+        // pauseAtEndOfMediaItems), seekToNextMediaItem() is unreliable — jump
+        // to the target window explicitly and re-arm playWhenReady.
+        if (direction > 0 && isPausedAtEndOfItem()) {
             playlistIndex = targetIndex;
             player.setPlayWhenReady(true);
             player.seekTo(playlistIndex, 0);
@@ -1606,8 +1827,11 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
         int queued = queuedAdvanceDuringSlide;
         queuedAdvanceDuringSlide = 0;
-        if (queued != 0) {
-            handler.post(() -> advance(queued));
+        if (queued > 0) {
+            // playNext() (not advance) so an empty tail still waits on the feed.
+            handler.post(this::playNext);
+        } else if (queued < 0) {
+            handler.post(this::playPrevious);
         }
     }
 
@@ -1659,7 +1883,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             FeedVideo next = pollNextFeedVideo();
             if (next == null) break;
             playlist.add(next);
-            player.addMediaItem(mediaItemFor(next));
+            enqueueVideo(next);
             SimpleImageLoader.preload(next.coverUrl);
         }
         trimPlaylistHead();
@@ -1928,15 +2152,29 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         creatorGridList.addOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
-                if (dy <= 0 || !creatorGridVisible) return;
-                GridLayoutManager layoutManager = (GridLayoutManager) recyclerView.getLayoutManager();
-                if (layoutManager == null) return;
-                int lastVisible = layoutManager.findLastVisibleItemPosition();
-                if (lastVisible >= creatorGridAdapter.getItemCount() - CREATOR_GRID_COLUMNS) {
-                    creatorRepository.kickstartPaging();
-                }
+                if (!creatorGridVisible) return;
+                maybeLoadMoreCreatorVideos(recyclerView);
             }
         });
+        creatorGridAdapter.setOnBindNearEndListener(position -> {
+            if (!creatorGridVisible) return;
+            int total = creatorGridAdapter.getItemCount();
+            if (total > 0 && position >= total - CREATOR_GRID_COLUMNS * 2) {
+                creatorRepository.kickstartPaging();
+            }
+        });
+    }
+
+    private void maybeLoadMoreCreatorVideos(RecyclerView recyclerView) {
+        GridLayoutManager layoutManager = (GridLayoutManager) recyclerView.getLayoutManager();
+        if (layoutManager == null || creatorGridAdapter == null) return;
+        int total = creatorGridAdapter.getItemCount();
+        if (total <= 0) return;
+        int lastVisible = layoutManager.findLastVisibleItemPosition();
+        // Prefetch when the last ~2 rows are on screen (TV D-pad may report dy=0).
+        if (lastVisible >= total - CREATOR_GRID_COLUMNS * 2) {
+            creatorRepository.kickstartPaging();
+        }
     }
 
     private void openCreatorGrid() {
@@ -1953,25 +2191,30 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
         creatorGridAdapter.setVideos(Collections.emptyList());
         creatorGridAwaitingPumpData = true;
-        setCreatorGridLoading(true);
 
         saveFeedAnchor();
         if (player != null) {
             player.pause();
         }
 
+        creatorGridVisible = true;
+        creatorGridOverlay.setVisibility(View.VISIBLE);
+
         creatorRepository.setCreator(secUid, current.authorName, current.authorAvatarUrl);
+        // Show the current video immediately while /aweme/post loads.
+        creatorRepository.addVideoIfMatching(current);
+        if (creatorRepository.size() > 0) {
+            creatorGridAwaitingPumpData = false;
+        }
 
         String activeSecUid = pump.getActiveCreatorSecUid();
         if (pump.isCreatorMode() && secUid.equals(activeSecUid)) {
             creatorRepository.kickstartPaging();
         } else {
+            // Direct signed /aweme/post fetch — do not also kickstart (avoids double request).
             pump.loadCreatorProfile(secUid);
-            creatorRepository.kickstartPaging();
         }
 
-        creatorGridVisible = true;
-        creatorGridOverlay.setVisibility(View.VISIBLE);
         updateCreatorGridUi();
         creatorGridList.post(() -> {
             if (creatorGridList.getChildCount() > 0) {
@@ -2009,14 +2252,15 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     }
 
     /**
-     * Returns to {@link #feedAnchorVideo} as playlist index {@code 0}, paused
-     * at the saved position. Next/preload items are added only after the user
-     * navigates with up/down.
+     * Returns to {@link #feedAnchorVideo} as playlist index {@code 0} and
+     * resumes playback at the saved position. Next/preload items are added
+     * only after the user navigates with up/down.
      */
     private void restoreFeedToAnchor() {
         playbackMode = PlaybackMode.FEED;
         waitingForBuffer = false;
         pendingAdvance = 0;
+        autoStartWhenReady = true;
 
         if (feedAnchorVideo == null || player == null) {
             updatePlaybackChrome();
@@ -2034,14 +2278,13 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         playlist.add(feedAnchorVideo);
         playlistIndex = 0;
 
-        player.addMediaItem(mediaItemFor(feedAnchorVideo));
+        enqueueVideo(feedAnchorVideo);
 
         current = feedAnchorVideo;
         player.prepare();
         player.seekTo(0, feedAnchorPositionMs);
         applyCurrentUi();
-        player.setPlayWhenReady(false);
-        player.pause();
+        player.setPlayWhenReady(true);
         updatePlaybackChrome();
     }
 
@@ -2056,9 +2299,34 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         for (int attempt = 0; attempt < 32; attempt++) {
             FeedVideo next = repository.pollNext();
             if (next == null) return null;
+            if (WatchedAwemeStore.getInstance().isWatched(next.awemeId)) continue;
             if (!isDuplicateForFeedPlaylist(next)) return next;
         }
         return null;
+    }
+
+    /**
+     * After account history sync, drop upcoming playlist items that were
+     * already watched on phone/web so they never reach ExoPlayer.
+     */
+    private void purgeWatchedFromUpcomingPlaylist() {
+        if (playbackMode == PlaybackMode.CREATOR || player == null) return;
+        WatchedAwemeStore store = WatchedAwemeStore.getInstance();
+        int removed = 0;
+        for (int i = playlist.size() - 1; i > playlistIndex; i--) {
+            FeedVideo video = playlist.get(i);
+            if (video == null || !store.isWatched(video.awemeId)) continue;
+            playlist.remove(i);
+            if (i < player.getMediaItemCount()) {
+                player.removeMediaItem(i);
+            }
+            resumePositions.remove(video.awemeId);
+            removed++;
+        }
+        if (removed > 0) {
+            Log.i(TAG, "purged " + removed + " watched items from upcoming playlist");
+            refillPlaylist();
+        }
     }
 
     private void exitCreatorPlaybackToGrid() {
@@ -2120,7 +2388,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         playlistIndex = index;
 
         for (FeedVideo video : playlist) {
-            player.addMediaItem(mediaItemFor(video));
+            enqueueVideo(video);
             SimpleImageLoader.preload(video.coverUrl);
         }
 
@@ -2198,7 +2466,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         for (FeedVideo video : creatorRepository.snapshot()) {
             if (!playlistContains(video.awemeId)) {
                 playlist.add(video);
-                player.addMediaItem(mediaItemFor(video));
+                enqueueVideo(video);
                 SimpleImageLoader.preload(video.coverUrl);
             }
         }

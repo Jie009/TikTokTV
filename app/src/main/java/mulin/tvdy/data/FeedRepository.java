@@ -149,10 +149,47 @@ public final class FeedRepository {
 
     /** Removes and returns the next video to play, or {@code null} if the buffer is empty. */
     public FeedVideo pollNext() {
-        FeedVideo next = queue.pollFirst();
-        notifyBufferChanged();
-        maybeRequestMore();
-        return next;
+        boolean skippedWatched = false;
+        while (true) {
+            FeedVideo next = queue.pollFirst();
+            if (next == null) {
+                if (skippedWatched) notifyBufferChanged();
+                maybeRequestMore();
+                return null;
+            }
+            // Defense in depth: history may arrive after items were enqueued.
+            if (!watchedFilterBypass && watchedStore.isWatched(next.awemeId)) {
+                Log.d(TAG, "pollNext skip watched " + next.awemeId);
+                skippedWatched = true;
+                continue;
+            }
+            notifyBufferChanged();
+            maybeRequestMore();
+            return next;
+        }
+    }
+
+    /**
+     * Drops buffered items that are now known-watched (e.g. after history sync).
+     * @return number of items removed
+     */
+    public int purgeWatchedFromQueue() {
+        if (watchedFilterBypass) return 0;
+        int removed = 0;
+        Iterator<FeedVideo> it = queue.iterator();
+        while (it.hasNext()) {
+            FeedVideo video = it.next();
+            if (watchedStore.isWatched(video.awemeId)) {
+                it.remove();
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            Log.d(TAG, "purgeWatchedFromQueue: -" + removed + " bufferSize=" + queue.size());
+            notifyBufferChanged();
+            maybeRequestMore();
+        }
+        return removed;
     }
 
     public int bufferSize() {
