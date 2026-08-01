@@ -268,7 +268,7 @@
     </FrameLayout>
 
     <!-- Placeholder long-press ("start" held down) feature list: account
-         login, like, follow, comments, etc. will eventually live here. Only
+         login / account actions live here. Only
          the shell + open/close (via back) is wired up for now. -->
     <LinearLayout
         android:id="@+id/featureMenu"
@@ -365,64 +365,6 @@
             <TextView
                 style="@style/FeatureMenuLabel"
                 android:text="查看博主作品" />
-
-        </LinearLayout>
-
-        <LinearLayout
-            android:id="@+id/featureMenuLike"
-            style="@style/FeatureMenuRow">
-
-            <ImageView
-                style="@style/FeatureMenuIcon"
-                android:src="@drawable/ic_like" />
-
-            <TextView
-                style="@style/FeatureMenuLabel"
-                android:text="点赞" />
-
-        </LinearLayout>
-
-        <LinearLayout
-            android:id="@+id/featureMenuFollow"
-            style="@style/FeatureMenuRow">
-
-            <ImageView
-                style="@style/FeatureMenuIcon"
-                android:src="@drawable/ic_follow" />
-
-            <TextView
-                style="@style/FeatureMenuLabel"
-                android:text="关注作者" />
-
-        </LinearLayout>
-
-        <LinearLayout
-            android:id="@+id/featureMenuComments"
-            style="@style/FeatureMenuRow">
-
-            <ImageView
-                style="@style/FeatureMenuIcon"
-                android:src="@drawable/ic_comment" />
-
-            <TextView
-                style="@style/FeatureMenuLabel"
-                android:text="查看评论" />
-
-        </LinearLayout>
-
-        <!-- DEBUG-only: dump / force split-stream playback for POC validation. -->
-        <LinearLayout
-            android:id="@+id/featureMenuSplitPoc"
-            style="@style/FeatureMenuRow"
-            android:visibility="gone">
-
-            <ImageView
-                style="@style/FeatureMenuIcon"
-                android:src="@drawable/ic_creator" />
-
-            <TextView
-                style="@style/FeatureMenuLabel"
-                android:text="分轨 POC" />
 
         </LinearLayout>
 

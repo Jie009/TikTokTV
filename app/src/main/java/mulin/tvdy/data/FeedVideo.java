@@ -43,15 +43,14 @@ public final class FeedVideo {
     public final String authorUniqueId;
 
     /**
-     * Server-reported counts at the time this item was fetched. Display
-     * only - there's no signed write-endpoint integration with the real
-     * douyin account, no in-app comment thread, and no remote-control
-     * binding to like/collect, so none of these ever change locally.
+     * Server-reported counts at the time this item was fetched (display-only).
      */
     public final long diggCount;
     public final long commentCount;
     public final long collectCount;
     public final long shareCount;
+    /** Whether the logged-in account had already digged this item in the feed payload. */
+    public final boolean userDigged;
 
     /** Paired video-only + audio-only progressive CDN URLs. */
     public static final class SplitPlayUrl {
@@ -80,7 +79,8 @@ public final class FeedVideo {
                       List<SplitPlayUrl> splitCandidates,
                       String authorName, String authorAvatarUrl,
                       String authorSecUid, String authorUniqueId,
-                      long diggCount, long commentCount, long collectCount, long shareCount) {
+                      long diggCount, long commentCount, long collectCount, long shareCount,
+                      boolean userDigged) {
         this.awemeId = awemeId;
         this.desc = desc;
         this.coverUrl = coverUrl;
@@ -95,6 +95,7 @@ public final class FeedVideo {
         this.commentCount = commentCount;
         this.collectCount = collectCount;
         this.shareCount = shareCount;
+        this.userDigged = userDigged;
     }
 
     /**
@@ -163,10 +164,12 @@ public final class FeedVideo {
         long commentCount = statistics != null ? statistics.optLong("comment_count", 0) : 0;
         long collectCount = statistics != null ? statistics.optLong("collect_count", 0) : 0;
         long shareCount = statistics != null ? statistics.optLong("share_count", 0) : 0;
+        boolean userDigged = item.optInt("user_digged", 0) == 1
+                || item.optBoolean("user_digged", false);
 
         return new FeedVideo(awemeId, desc, coverUrl, playUrl, candidates, splits,
                 authorName, authorAvatarUrl, authorSecUid, authorUniqueId,
-                diggCount, commentCount, collectCount, shareCount);
+                diggCount, commentCount, collectCount, shareCount, userDigged);
     }
 
     /** True when this item has at least one video+audio split pair. */

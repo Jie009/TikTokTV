@@ -58,7 +58,6 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import mulin.tvdy.BuildConfig;
 import mulin.tvdy.DeviceUtils;
 import mulin.tvdy.DouyinConstants;
 import mulin.tvdy.R;
@@ -87,11 +86,7 @@ import mulin.tvdy.pump.FeedPumpController;
  * its show-overlay/play/pause semantics - and a long-press on it opens a
  * (currently placeholder) feature menu, closed with back. All chrome (title/
  * author up top, time/progress/stats at the bottom) auto-hides after
- * {@value #CONTROLS_AUTO_HIDE_MS}ms - see {@link #showControls}. The like/
- * collect counts are read-only display of douyin's real numbers - there's no
- * remote-control binding to toggle them and no signed write-endpoint
- * integration with the real douyin account, only the read-side data pump
- * described in {@link FeedPumpController}.
+ * {@value #CONTROLS_AUTO_HIDE_MS}ms - see {@link #showControls}.
  * <p>
  * Playback uses a small ExoPlayer playlist window (see {@link #playlist})
  * rather than swapping a single {@link MediaItem} in place: the next
@@ -228,6 +223,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
     private TextView positionText;
     private TextView durationText;
     private ProgressBar seekProgress;
+    private ImageView likeIcon;
     private TextView likeCountText;
     private TextView commentCountText;
     private TextView collectCountText;
@@ -343,6 +339,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         positionText = findViewById(R.id.positionText);
         durationText = findViewById(R.id.durationText);
         seekProgress = findViewById(R.id.seekProgress);
+        likeIcon = findViewById(R.id.likeIcon);
         likeCountText = findViewById(R.id.likeCount);
         commentCountText = findViewById(R.id.commentCount);
         collectCountText = findViewById(R.id.collectCount);
@@ -1156,7 +1153,7 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
         }
     }
 
-    /** Login/logout and creator browse are wired; the rest are placeholders. */
+    /** Login/logout and creator browse. */
     private void activateSelectedMenuItem() {
         if (menuItems.isEmpty()) return;
         int index = menuSelectedIndex;
@@ -1169,31 +1166,17 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             openCreatorGrid();
         } else if (id == R.id.featureMenuLogout) {
             logout();
-        } else if (id == R.id.featureMenuSplitPoc) {
-            runSplitStreamPoc();
-        } else {
-            Toast.makeText(this, "功能开发中", Toast.LENGTH_SHORT).show();
         }
     }
 
     private void rebuildMenuItems() {
         menuItems.clear();
-        View splitPoc = findViewById(R.id.featureMenuSplitPoc);
         if (loggedIn) {
             featureMenuAccountHeader.setVisibility(View.VISIBLE);
             featureMenuAccountDivider.setVisibility(View.VISIBLE);
             featureMenuLogin.setVisibility(View.GONE);
             featureMenuLogout.setVisibility(View.VISIBLE);
             menuItems.add(findViewById(R.id.featureMenuCreator));
-            menuItems.add(findViewById(R.id.featureMenuLike));
-            menuItems.add(findViewById(R.id.featureMenuFollow));
-            menuItems.add(findViewById(R.id.featureMenuComments));
-            if (BuildConfig.DEBUG && splitPoc != null) {
-                splitPoc.setVisibility(View.VISIBLE);
-                menuItems.add(splitPoc);
-            } else if (splitPoc != null) {
-                splitPoc.setVisibility(View.GONE);
-            }
             menuItems.add(featureMenuLogout);
         } else {
             featureMenuAccountHeader.setVisibility(View.GONE);
@@ -1202,57 +1185,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
             featureMenuLogout.setVisibility(View.GONE);
             menuItems.add(featureMenuLogin);
             menuItems.add(findViewById(R.id.featureMenuCreator));
-            menuItems.add(findViewById(R.id.featureMenuLike));
-            menuItems.add(findViewById(R.id.featureMenuFollow));
-            menuItems.add(findViewById(R.id.featureMenuComments));
-            if (BuildConfig.DEBUG && splitPoc != null) {
-                splitPoc.setVisibility(View.VISIBLE);
-                menuItems.add(splitPoc);
-            } else if (splitPoc != null) {
-                splitPoc.setVisibility(View.GONE);
-            }
         }
         if (menuSelectedIndex >= menuItems.size()) {
             menuSelectedIndex = 0;
-        }
-    }
-
-    /**
-     * DEBUG POC: log HEVC capability + current item's split/muxed URLs, then
-     * force-reload the current item through {@link #mediaSourceFor}.
-     */
-    private void runSplitStreamPoc() {
-        boolean hevc = HevcCapability.isSupported();
-        if (current == null) {
-            Toast.makeText(this, "无当前视频；HEVC=" + hevc, Toast.LENGTH_LONG).show();
-            Log.i(TAG, "split POC: no current video hevc=" + hevc);
-            return;
-        }
-        Log.i(TAG, "split POC awemeId=" + current.awemeId
-                + " hevcDevice=" + hevc
-                + " splits=" + current.splitCandidates.size()
-                + " muxed=" + current.playUrlCandidates.size()
-                + " selected=" + FeedVideo.shortUrl(playbackUrlFor(current)));
-        for (int i = 0; i < current.splitCandidates.size(); i++) {
-            Log.i(TAG, "split POC candidate[" + i + "]=" + current.splitCandidates.get(i));
-        }
-        for (int i = 0; i < Math.min(3, current.playUrlCandidates.size()); i++) {
-            Log.i(TAG, "split POC muxed[" + i + "]="
-                    + FeedVideo.shortUrl(current.playUrlCandidates.get(i)));
-        }
-        splitCandidateIndex.remove(current.awemeId);
-        playUrlCandidateIndex.put(current.awemeId, 0);
-        if (current.hasSplitStream()) {
-            Toast.makeText(this,
-                    "分轨×" + current.splitCandidates.size() + " HEVC=" + hevc + " → 重载",
-                    Toast.LENGTH_LONG).show();
-        } else {
-            Toast.makeText(this,
-                    "feed无分轨URL，走低码率muxed；HEVC=" + hevc,
-                    Toast.LENGTH_LONG).show();
-        }
-        if (player != null && playlistIndex >= 0) {
-            replaceCurrentSource();
         }
     }
 
@@ -1992,6 +1927,9 @@ public class PlayerActivity extends Activity implements FeedRepository.Listener 
 
     private void updateLikeUi(FeedVideo video) {
         likeCountText.setText(formatCount(video.diggCount));
+        if (likeIcon != null) {
+            likeIcon.setColorFilter(0xFFFFFFFF);
+        }
     }
 
     private void updateCollectUi(FeedVideo video) {

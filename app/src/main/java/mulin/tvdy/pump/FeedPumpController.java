@@ -1355,6 +1355,8 @@ public final class FeedPumpController implements PageRequester {
 
         if (generation != kickstartGeneration || webView == null) return;
 
+        if (creatorMode) return;
+
         if (repository.bufferSize() > 0) return;
 
 
